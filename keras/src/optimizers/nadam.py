@@ -51,7 +51,7 @@ class Nadam(optimizer.Optimizer):
         ema_overwrite_frequency=None,
         loss_scale_factor=None,
         gradient_accumulation_steps=None,
-        name="nadam",
+        name=None,
         **kwargs,
     ):
         super().__init__(
@@ -87,21 +87,10 @@ class Nadam(optimizer.Optimizer):
         else:
             dtype = backend.floatx()
         super().build(var_list)
-        self._momentums = []
-        self._velocities = []
+        self._momentums, self._velocities = self.add_optimizer_variables(
+            var_list, ["momentum", "velocity"]
+        )
         self._u_product = backend.Variable(1.0, dtype=dtype)
-
-        for var in var_list:
-            self._momentums.append(
-                self.add_variable_from_reference(
-                    reference_variable=var, name="momentum"
-                )
-            )
-            self._velocities.append(
-                self.add_variable_from_reference(
-                    reference_variable=var, name="velocity"
-                )
-            )
 
     def _backend_update_step(self, grads, trainable_variables, learning_rate):
         dtype = self._u_product.dtype
@@ -169,6 +158,7 @@ class Nadam(optimizer.Optimizer):
         return config
 
 
-Nadam.__doc__ = Nadam.__doc__.replace(
-    "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
-)
+if Nadam.__doc__ is not None:
+    Nadam.__doc__ = Nadam.__doc__.replace(
+        "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
+    )

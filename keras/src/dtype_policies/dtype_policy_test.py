@@ -3,17 +3,19 @@ from absl.testing import parameterized
 from keras.src.dtype_policies import deserialize
 from keras.src.dtype_policies import get
 from keras.src.dtype_policies import serialize
+from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
 from keras.src.dtype_policies.dtype_policy import DTypePolicy
 from keras.src.dtype_policies.dtype_policy import FloatDTypePolicy
 from keras.src.dtype_policies.dtype_policy import QuantizedDTypePolicy
 from keras.src.dtype_policies.dtype_policy import QuantizedFloat8DTypePolicy
 from keras.src.dtype_policies.dtype_policy import dtype_policy
 from keras.src.dtype_policies.dtype_policy import set_dtype_policy
+from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.testing import test_case
 
 
-class FloatDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
-    """Test `FloatDTypePolicy`.
+class DTypePolicyTest(test_case.TestCase):
+    """Test `DTypePolicy`.
 
     In the tests, we also test `DTypePolicy` for historical reasons.
     """
@@ -113,13 +115,13 @@ class FloatDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
         self.assertEqual(policy.variable_dtype, "float32")
         self.assertEqual(policy.compute_dtype, "float16")
         self.assertEqual(policy.name, "mixed_float16")
-        self.assertFalse(policy.is_quantized)
+        self.assertIsNone(policy.quantization_mode)
 
         policy = FloatDTypePolicy("mixed_float16")
         self.assertEqual(policy.variable_dtype, "float32")
         self.assertEqual(policy.compute_dtype, "float16")
         self.assertEqual(policy.name, "mixed_float16")
-        self.assertFalse(policy.is_quantized)
+        self.assertIsNone(policy.quantization_mode)
 
     def test_properties_uint8(self):
         """Test properties for 'uint8'."""
@@ -136,10 +138,10 @@ class FloatDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
     def test_repr(self):
         """Test __repr__ method."""
         policy = DTypePolicy("mixed_float16")
-        self.assertEqual(repr(policy), '<FloatDTypePolicy "mixed_float16">')
+        self.assertEqual(repr(policy), '<DTypePolicy "mixed_float16">')
 
         policy = FloatDTypePolicy("mixed_float16")
-        self.assertEqual(repr(policy), '<FloatDTypePolicy "mixed_float16">')
+        self.assertEqual(repr(policy), '<DTypePolicy "mixed_float16">')
 
     def test_get_config_from_config(self):
         """Test get_config and from_config methods."""
@@ -184,49 +186,50 @@ class FloatDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
 
         # copy.deepcopy
         copied_policy = copy.deepcopy(policy)
-        self.assertEqual(
-            repr(copied_policy), '<FloatDTypePolicy "mixed_float16">'
-        )
+        self.assertEqual(repr(copied_policy), '<DTypePolicy "mixed_float16">')
         # copy.copy
         copied_policy = copy.copy(policy)
-        self.assertEqual(
-            repr(copied_policy), '<FloatDTypePolicy "mixed_float16">'
-        )
+        self.assertEqual(repr(copied_policy), '<DTypePolicy "mixed_float16">')
         # pickle
         temp_dir = self.get_temp_dir()
         with open(f"{temp_dir}/policy.pickle", "wb") as f:
             pickle.dump(policy, f)
         with open(f"{temp_dir}/policy.pickle", "rb") as f:
             copied_policy = pickle.load(f)
-        self.assertEqual(
-            repr(copied_policy), '<FloatDTypePolicy "mixed_float16">'
-        )
+        self.assertEqual(repr(copied_policy), '<DTypePolicy "mixed_float16">')
 
         # Test FloatDTypePolicy
         policy = FloatDTypePolicy("mixed_float16")
 
         # copy.deepcopy
         copied_policy = copy.deepcopy(policy)
-        self.assertEqual(
-            repr(copied_policy), '<FloatDTypePolicy "mixed_float16">'
-        )
+        self.assertEqual(repr(copied_policy), '<DTypePolicy "mixed_float16">')
         # copy.copy
         copied_policy = copy.copy(policy)
-        self.assertEqual(
-            repr(copied_policy), '<FloatDTypePolicy "mixed_float16">'
-        )
+        self.assertEqual(repr(copied_policy), '<DTypePolicy "mixed_float16">')
         # pickle
         temp_dir = self.get_temp_dir()
         with open(f"{temp_dir}/policy.pickle", "wb") as f:
             pickle.dump(policy, f)
         with open(f"{temp_dir}/policy.pickle", "rb") as f:
             copied_policy = pickle.load(f)
-        self.assertEqual(
-            repr(copied_policy), '<FloatDTypePolicy "mixed_float16">'
+        self.assertEqual(repr(copied_policy), '<DTypePolicy "mixed_float16">')
+
+    def test_eq(self):
+        policy = DTypePolicy("mixed_bfloat16")
+
+        # Test True
+        self.assertEqual(policy, DTypePolicy("mixed_bfloat16"))
+        self.assertEqual(policy, FloatDTypePolicy("mixed_bfloat16"))
+
+        # Test False
+        self.assertNotEqual(policy, "mixed_float16")
+        self.assertNotEqual(
+            policy, QuantizedDTypePolicy("int8", "mixed_bfloat16")
         )
 
 
-class QuantizedDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
+class QuantizedDTypePolicyTest(test_case.TestCase):
     def setUp(self):
         """Record the global dtype policy before each test."""
         super().setUp()
@@ -352,7 +355,7 @@ class QuantizedDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
         self.assertEqual(policy.variable_dtype, "float32")
         self.assertEqual(policy.compute_dtype, "bfloat16")
         self.assertEqual(policy.name, "int8_from_mixed_bfloat16")
-        self.assertTrue(policy.is_quantized)
+        self.assertEqual(policy.quantization_mode, "int8")
 
         # Test float8
         policy = QuantizedFloat8DTypePolicy(
@@ -361,7 +364,7 @@ class QuantizedDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
         self.assertEqual(policy.variable_dtype, "float32")
         self.assertEqual(policy.compute_dtype, "bfloat16")
         self.assertEqual(policy.name, "float8_from_mixed_bfloat16")
-        self.assertTrue(policy.is_quantized)
+        self.assertEqual(policy.quantization_mode, "float8")
         self.assertEqual(policy.amax_history_length, 1024)
 
         # Test float8 with amax_history_length
@@ -494,6 +497,19 @@ class QuantizedDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
             policy.amax_history_length, reloaded_policy.amax_history_length
         )
 
+    def test_eq(self):
+        policy = QuantizedDTypePolicy("int8", "mixed_bfloat16")
+
+        # Test True
+        self.assertEqual(policy, QuantizedDTypePolicy("int8", "mixed_bfloat16"))
+
+        # Test False
+        self.assertNotEqual(policy, "mixed_bfloat16")
+        self.assertNotEqual(policy, DTypePolicy("mixed_bfloat16"))
+        self.assertNotEqual(
+            policy, QuantizedFloat8DTypePolicy("float8", "mixed_bfloat16")
+        )
+
     @parameterized.named_parameters(
         ("int8_from_mixed_bfloat16", "int8_from_mixed_bfloat16"),
         ("float8_from_mixed_bfloat16", "float8_from_mixed_bfloat16"),
@@ -522,6 +538,7 @@ class QuantizedDTypePolicyTest(test_case.TestCase, parameterized.TestCase):
 
 class DTypePolicyGlobalFunctionsTest(test_case.TestCase):
     def setUp(self):
+        super().setUp()
         """Reset the global dtype policy before each test."""
         set_dtype_policy("float32")
 
@@ -538,14 +555,14 @@ class DTypePolicyGlobalFunctionsTest(test_case.TestCase):
         self.assertEqual(policy.name, "int8_from_mixed_bfloat16")
 
     def test_set_dtype_policy_valid_policy(self):
-        """Test set_dtype_policy with a valid FloatDTypePolicy object."""
-        policy_obj = FloatDTypePolicy("mixed_float16")
+        """Test set_dtype_policy with a valid DTypePolicy object."""
+        policy_obj = DTypePolicy("mixed_float16")
         set_dtype_policy(policy_obj)
         policy = dtype_policy()
         self.assertEqual(policy.name, "mixed_float16")
 
     def test_set_dtype_policy_valid_policy_quantized(self):
-        """Test set_dtype_policy with a valid FloatDTypePolicy object."""
+        """Test set_dtype_policy with a valid QuantizedDTypePolicy object."""
         policy_obj = QuantizedDTypePolicy(
             mode="int8", source_name="mixed_bfloat16"
         )
@@ -570,12 +587,24 @@ class DTypePolicyGlobalFunctionsTest(test_case.TestCase):
         policy = get("mixed_float16")
         self.assertEqual(policy.name, "mixed_float16")
 
+        policy = get(DTypePolicy("bfloat16"))
+        self.assertEqual(policy.name, "bfloat16")
+
+        policy = get(FloatDTypePolicy("mixed_float16"))
+        self.assertEqual(policy.name, "mixed_float16")
+
     def test_get_valid_policy_quantized(self):
         policy = get("int8_from_mixed_bfloat16")
         self.assertEqual(policy.name, "int8_from_mixed_bfloat16")
 
         policy = get("float8_from_float32")
         self.assertEqual(policy.name, "float8_from_float32")
+
+        policy = get(QuantizedDTypePolicy("int8", "mixed_bfloat16"))
+        self.assertEqual(policy.name, "int8_from_mixed_bfloat16")
+
+        policy = get(QuantizedFloat8DTypePolicy("float8", "mixed_float16"))
+        self.assertEqual(policy.name, "float8_from_mixed_float16")
 
     def test_get_invalid_policy(self):
         with self.assertRaisesRegex(ValueError, "Cannot convert"):
@@ -596,26 +625,26 @@ class DTypePolicyGlobalFunctionsTest(test_case.TestCase):
             get("int8_abc_")
 
 
-class FloatDTypePolicyEdgeCasesTest(test_case.TestCase):
+class DTypePolicyEdgeCasesTest(test_case.TestCase):
     def test_empty_name(self):
         """Test initialization with an empty name."""
         with self.assertRaisesRegex(ValueError, "Cannot convert"):
-            FloatDTypePolicy("")
+            DTypePolicy("")
 
     def test_special_character_name(self):
         """Test initialization with special characters in the name."""
         with self.assertRaisesRegex(ValueError, "Cannot convert"):
-            FloatDTypePolicy("@mixed_float16!")
+            DTypePolicy("@mixed_float16!")
 
     def test_very_long_name(self):
         """Test initialization with a very long name."""
         with self.assertRaisesRegex(ValueError, "Cannot convert"):
-            FloatDTypePolicy("mixed_float16" * 100)
+            DTypePolicy("mixed_float16" * 100)
 
     def test_almost_valid_name(self):
         """Test initialization with a name close to a valid one."""
         with self.assertRaisesRegex(ValueError, "Cannot convert"):
-            FloatDTypePolicy("mixed_float15")
+            DTypePolicy("mixed_float15")
 
 
 class QuantizedDTypePolicyEdgeCasesTest(test_case.TestCase):
@@ -648,6 +677,7 @@ class QuantizedDTypePolicyEdgeCasesTest(test_case.TestCase):
 
 class DTypePolicyGlobalFunctionsEdgeCasesTest(test_case.TestCase):
     def setUp(self):
+        super().setUp()
         """Reset the global dtype policy before each test."""
         set_dtype_policy("float32")
 
@@ -665,3 +695,76 @@ class DTypePolicyGlobalFunctionsEdgeCasesTest(test_case.TestCase):
         """Test setting the policy to None."""
         with self.assertRaisesRegex(ValueError, "Invalid `policy` argument"):
             set_dtype_policy(None)
+
+
+class GPTQConfigErrorHandlingTest(test_case.TestCase):
+    """Test error handling in GPTQConfig."""
+
+    def test_invalid_weight_bits(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported weight_bits"):
+            GPTQConfig(
+                dataset=None,
+                tokenizer=None,
+                weight_bits=5,
+            )
+
+    def test_negative_num_samples(self):
+        with self.assertRaisesRegex(
+            ValueError, "num_samples must be a positive integer."
+        ):
+            GPTQConfig(
+                dataset=None,
+                tokenizer=None,
+                num_samples=-10,
+            )
+
+    def test_zero_sequence_length(self):
+        with self.assertRaisesRegex(
+            ValueError, "sequence_length must be a positive integer."
+        ):
+            GPTQConfig(
+                dataset=None,
+                tokenizer=None,
+                sequence_length=0,
+            )
+
+    def test_invalid_hessian_damping(self):
+        with self.assertRaisesRegex(
+            ValueError, "hessian_damping must be between 0 and 1."
+        ):
+            GPTQConfig(
+                dataset=None,
+                tokenizer=None,
+                hessian_damping=1.5,
+            )
+
+    def test_invalid_group_size(self):
+        with self.assertRaisesRegex(
+            ValueError, "Invalid group_size. Supported values are -1"
+        ):
+            GPTQConfig(
+                dataset=None,
+                tokenizer=None,
+                group_size=0,
+            )
+
+
+class AWQDTypePolicyTest(test_case.TestCase):
+    """Test AWQDTypePolicy creation and error handling."""
+
+    def test_awq_dtype_policy_creation(self):
+        """Test AWQDTypePolicy can be created."""
+        policy = AWQDTypePolicy("awq/4/128", source_name="float32")
+        self.assertEqual(policy.weight_bits, 4)
+        self.assertEqual(policy.group_size, 128)
+        self.assertEqual(policy.mode, "awq")
+
+    def test_awq_dtype_policy_invalid_bits(self):
+        """Test AWQDTypePolicy rejects non-4-bit."""
+        with self.assertRaisesRegex(ValueError, "only supports 4-bit"):
+            AWQDTypePolicy("awq/8/128", source_name="float32")
+
+    def test_awq_dtype_policy_invalid_format(self):
+        """Test AWQDTypePolicy rejects invalid format."""
+        with self.assertRaisesRegex(ValueError, "Invalid mode"):
+            AWQDTypePolicy("awq/4", source_name="float32")

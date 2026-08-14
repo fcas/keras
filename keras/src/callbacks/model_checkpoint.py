@@ -6,13 +6,13 @@ import numpy as np
 
 from keras.src import backend
 from keras.src.api_export import keras_export
-from keras.src.callbacks.callback import Callback
+from keras.src.callbacks.monitor_callback import MonitorCallback
 from keras.src.utils import file_utils
 from keras.src.utils import io_utils
 
 
 @keras_export("keras.callbacks.ModelCheckpoint")
-class ModelCheckpoint(Callback):
+class ModelCheckpoint(MonitorCallback):
     """Callback to save the Keras model or model weights at some frequency.
 
     `ModelCheckpoint` callback is used in conjunction with training using
@@ -34,10 +34,21 @@ class ModelCheckpoint(Callback):
     Example:
 
     ```python
-    model.compile(loss=..., optimizer=...,
-                  metrics=['accuracy'])
+    # Define a learning rate schedule
+    initial_learning_rate = 0.1
+    lr_schedule = keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate,
+        decay_steps=100000,
+        decay_rate=0.96,
+        staircase=True,
+    )
 
-    EPOCHS = 10
+    model.compile(
+        optimizer=keras.optimizers.RMSprop(learning_rate=lr_schedule),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
     checkpoint_filepath = '/tmp/ckpt/checkpoint.model.keras'
     model_checkpoint_callback = keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_filepath,
@@ -46,7 +57,9 @@ class ModelCheckpoint(Callback):
         save_best_only=True)
 
     # Model is saved at the end of every epoch, if it's the best seen so far.
-    model.fit(epochs=EPOCHS, callbacks=[model_checkpoint_callback])
+    model.fit(
+        x_train, y_train, epochs=10, callbacks=[model_checkpoint_callback]
+    )
 
     # The model (that are considered the best) can be loaded as -
     keras.models.load_model(checkpoint_filepath)
@@ -62,10 +75,49 @@ class ModelCheckpoint(Callback):
 
     # Model weights are saved at the end of every epoch, if it's the best seen
     # so far.
-    model.fit(epochs=EPOCHS, callbacks=[model_checkpoint_callback])
+    model.fit(
+        x_train, y_train, epochs=10, callbacks=[model_checkpoint_callback]
+    )
 
     # The model weights (that are considered the best) can be loaded as -
     model.load_weights(checkpoint_filepath)
+    ```
+
+    Resuming training from weight-only checkpoints:
+
+    When using `save_weights_only=True`, the weights file includes the state
+    of the optimizer (including iteration count and learning rate state)
+    if the model is compiled at the time of saving.
+
+    To correctly resume training and restore the optimizer state (e.g., to
+    continue a learning rate schedule without resetting it), you must
+    **compile the model before loading the weights**.
+
+    ```python
+    # Define a learning rate schedule
+    initial_learning_rate = 0.1
+    lr_schedule = keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate,
+        decay_steps=100000,
+        decay_rate=0.96,
+        staircase=True,
+    )
+
+    # 1. Create a fresh model instance
+    model = get_model()
+
+    # 2. Compile the model *before* loading weights
+    model.compile(
+        optimizer=keras.optimizers.RMSprop(learning_rate=lr_schedule),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+    # 3. Load weights (optimizer state is restored automatically)
+    model.load_weights(checkpoint_filepath)
+
+    # 4. Continue training
+    model.fit(x_train, y_train, epochs=10)
     ```
 
     Args:
@@ -74,12 +126,13 @@ class ModelCheckpoint(Callback):
             which will be filled the value of `epoch` and keys in `logs`
             (passed in `on_epoch_end`).
             The `filepath` name needs to end with `".weights.h5"` when
-            `save_weights_only=True` or should end with `".keras"` when
-            checkpoint saving the whole model (default).
+            `save_weights_only=True` or should end with `".keras"` or `".h5"`
+            when checkpoint saving the whole model (default).
             For example:
-            if `filepath` is `"{epoch:02d}-{val_loss:.2f}.keras"`, then the
-            model checkpoints will be saved with the epoch number and the
-            validation loss in the filename. The directory of the filepath
+            if `filepath` is `"{epoch:02d}-{val_loss:.2f}.keras"` or
+            "{epoch:02d}-{val_loss:.2f}.weights.h5"`, then the model
+            checkpoints will be saved with the epoch number and the validation
+            loss in the filename. The directory of the filepath
             should not be reused by any other callbacks to avoid conflicts.
         monitor: The metric name to monitor. Typically the metrics are set by
             the `Model.compile` method. Note:
@@ -104,9 +157,8 @@ class ModelCheckpoint(Callback):
             decision to overwrite the current save file is made based on either
             the maximization or the minimization of the monitored quantity.
             For `val_acc`, this should be `"max"`, for `val_loss` this should be
-            `"min"`, etc. In `"auto"` mode, the mode is set to `"max"` if the
-            quantities monitored are `"acc"` or start with `"fmeasure"` and are
-            set to `"min"` for the rest of the quantities.
+            `"min"`, etc. In `"auto"` mode, the direction is automatically
+            inferred from the name of the monitored quantity.
         save_weights_only: if `True`, then only the model's weights will be
             saved (`model.save_weights(filepath)`), else the full model is
             saved (`model.save(filepath)`).
@@ -135,42 +187,14 @@ class ModelCheckpoint(Callback):
         save_freq="epoch",
         initial_value_threshold=None,
     ):
-        super().__init__()
-        self.monitor = monitor
+        super().__init__(monitor, mode, initial_value_threshold)
         self.verbose = verbose
         self.filepath = file_utils.path_to_string(filepath)
         self.save_best_only = save_best_only
         self.save_weights_only = save_weights_only
         self.save_freq = save_freq
         self._batches_seen_since_last_saving = 0
-        self._last_batch_seen = 0
-        self.best = initial_value_threshold
-
-        if mode not in ["auto", "min", "max"]:
-            warnings.warn(
-                f"ModelCheckpoint mode '{mode}' is unknown, "
-                "fallback to auto mode.",
-                stacklevel=2,
-            )
-            mode = "auto"
-
-        if mode == "min":
-            self.monitor_op = np.less
-            if self.best is None:
-                self.best = np.Inf
-        elif mode == "max":
-            self.monitor_op = np.greater
-            if self.best is None:
-                self.best = -np.Inf
-        else:
-            if "acc" in self.monitor or self.monitor.startswith("fmeasure"):
-                self.monitor_op = np.greater
-                if self.best is None:
-                    self.best = -np.Inf
-            else:
-                self.monitor_op = np.less
-                if self.best is None:
-                    self.best = np.Inf
+        self._last_batch_seen = None
 
         if self.save_freq != "epoch" and not isinstance(self.save_freq, int):
             raise ValueError(
@@ -187,7 +211,9 @@ class ModelCheckpoint(Callback):
                     f"filepath={self.filepath}"
                 )
         else:
-            if not self.filepath.endswith(".keras"):
+            if not any(
+                self.filepath.endswith(ext) for ext in (".keras", ".h5")
+            ):
                 raise ValueError(
                     "The filepath provided must end in `.keras` "
                     "(Keras model format). Received: "
@@ -202,6 +228,10 @@ class ModelCheckpoint(Callback):
         self._current_epoch = epoch
 
     def on_epoch_end(self, epoch, logs=None):
+        if self.monitor_op is None:
+            # Delay setup until the model's metrics are all built
+            self._set_monitor_op()
+
         if self.save_freq == "epoch":
             self._save_model(epoch=epoch, batch=None, logs=logs)
 
@@ -209,7 +239,8 @@ class ModelCheckpoint(Callback):
         """Handles batch-level saving logic, supports steps_per_execution."""
         if self.save_freq == "epoch":
             return False
-        if batch <= self._last_batch_seen:  # New epoch.
+        if self._last_batch_seen is None or batch <= self._last_batch_seen:
+            # New epoch.
             add_batches = batch + 1  # batches are zero-indexed.
         else:
             add_batches = batch - self._last_batch_seen
@@ -221,6 +252,68 @@ class ModelCheckpoint(Callback):
             return True
         return False
 
+    def _should_save_model(self, epoch, batch, logs, filepath):
+        """Determines whether the model should be saved.
+
+        The model should be saved in the following cases:
+
+        - self.save_best_only is False
+        - self.save_best_only is True and `monitor` is a numpy array or
+          backend tensor (falls back to `save_best_only=False`)
+        - self.save_best_only is True and `self.monitor_op(current, self.best)`
+          evaluates to True.
+
+        Args:
+            epoch: the epoch this iteration is in.
+            batch: the batch this iteration is in. `None` if the `save_freq`
+                is set to `"epoch"`.
+            logs: the `logs` dict passed in to `on_batch_end` or
+                `on_epoch_end`.
+            filepath: the path where the model would be saved
+        """
+        logs = logs or {}
+        if self.save_best_only:
+            current = logs.get(self.monitor)
+            if current is None:
+                warnings.warn(
+                    f"Can save best model only with {self.monitor} available.",
+                    stacklevel=2,
+                )
+                return True
+            elif (
+                isinstance(current, np.ndarray) or backend.is_tensor(current)
+            ) and len(current.shape) > 0:
+                warnings.warn(
+                    "Can save best model only when `monitor` is "
+                    f"a scalar value. Received: {current}. "
+                    "Falling back to `save_best_only=False`."
+                )
+                return True
+            else:
+                best_str = "None" if self.best is None else f"{self.best:.5f}"
+                if self._is_improvement(current, self.best):
+                    if self.verbose > 0:
+                        io_utils.print_msg(
+                            f"\nEpoch {epoch + 1}: {self.monitor} "
+                            f"improved from {best_str} to {current:.5f}, "
+                            f"saving model to {filepath}"
+                        )
+                    self.best = current
+                    return True
+                else:
+                    if self.verbose > 0:
+                        io_utils.print_msg(
+                            f"\nEpoch {epoch + 1}: "
+                            f"{self.monitor} did not improve from {best_str}"
+                        )
+                    return False
+        else:
+            if self.verbose > 0:
+                io_utils.print_msg(
+                    f"\nEpoch {epoch + 1}: saving model to {filepath}"
+                )
+            return True
+
     def _save_model(self, epoch, batch, logs):
         """Saves the model.
 
@@ -230,63 +323,24 @@ class ModelCheckpoint(Callback):
                 is set to `"epoch"`.
             logs: the `logs` dict passed in to `on_batch_end` or `on_epoch_end`.
         """
-        logs = logs or {}
-
         filepath = self._get_file_path(epoch, batch, logs)
-        # Create host directory if it doesn't exist.
-        dirname = os.path.dirname(filepath)
-        if dirname and not file_utils.exists(dirname):
-            file_utils.makedirs(dirname)
 
         try:
-            if self.save_best_only:
-                current = logs.get(self.monitor)
-                if current is None:
-                    warnings.warn(
-                        f"Can save best model only with {self.monitor} "
-                        "available, skipping.",
-                        stacklevel=2,
-                    )
-                elif (
-                    isinstance(current, np.ndarray)
-                    or backend.is_tensor(current)
-                ) and len(current.shape) > 0:
-                    warnings.warn(
-                        "Can save best model only when `monitor` is "
-                        f"a scalar value. Received: {current}. "
-                        "Falling back to `save_best_only=False`."
-                    )
-                    self.model.save(filepath, overwrite=True)
-                else:
-                    if self.monitor_op(current, self.best):
-                        if self.verbose > 0:
-                            io_utils.print_msg(
-                                f"\nEpoch {epoch + 1}: {self.monitor} "
-                                "improved "
-                                f"from {self.best:.5f} to {current:.5f}, "
-                                f"saving model to {filepath}"
-                            )
-                        self.best = current
-                        if self.save_weights_only:
-                            self.model.save_weights(filepath, overwrite=True)
-                        else:
-                            self.model.save(filepath, overwrite=True)
-                    else:
-                        if self.verbose > 0:
-                            io_utils.print_msg(
-                                f"\nEpoch {epoch + 1}: "
-                                f"{self.monitor} did not improve "
-                                f"from {self.best:.5f}"
-                            )
-            else:
-                if self.verbose > 0:
-                    io_utils.print_msg(
-                        f"\nEpoch {epoch + 1}: saving model to {filepath}"
-                    )
+            if self._should_save_model(epoch, batch, logs, filepath):
+                # Create host directory if it doesn't exist.
+                dirname = os.path.dirname(filepath)
+                if dirname and not file_utils.exists(dirname):
+                    file_utils.makedirs(dirname)
+
                 if self.save_weights_only:
                     self.model.save_weights(filepath, overwrite=True)
                 else:
                     self.model.save(filepath, overwrite=True)
+                if self.verbose > 0:
+                    io_utils.print_msg(
+                        f"\nEpoch {epoch + 1}: "
+                        f"finished saving model to {filepath}"
+                    )
         except IsADirectoryError:  # h5py 3.x
             raise IOError(
                 "Please specify a non-directory filepath for "
@@ -341,7 +395,7 @@ class ModelCheckpoint(Callback):
         later time of modification (for instance, when epoch/batch is used as
         formatting option), but not necessarily (when accuracy or loss is used).
         The tie-breaker is put in the logic as best effort to return the most
-        recent, and to avoid undeterministic result.
+        recent, and to avoid nondeterministic result.
 
         Modified time of a file is obtained with `os.path.getmtime()`.
 
@@ -376,7 +430,7 @@ class ModelCheckpoint(Callback):
         """
         dir_name = os.path.dirname(pattern)
         base_name = os.path.basename(pattern)
-        base_name_regex = "^" + re.sub(r"{.*}", r".*", base_name) + "$"
+        base_name_regex = f"^{re.sub(r'{.*}', r'.*', base_name)}$"
 
         latest_mod_time = 0
         file_path_with_latest_mod_time = None

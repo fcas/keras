@@ -28,7 +28,6 @@ class MeanSquaredError(reduction_metrics.MeanMetricWrapper):
         dtype: (Optional) data type of the metric result.
 
     Example:
-
     >>> m = keras.metrics.MeanSquaredError()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
     >>> m.result()
@@ -64,6 +63,7 @@ class MeanAbsoluteError(reduction_metrics.MeanMetricWrapper):
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
     >>> m.result()
     0.25
+
     >>> m.reset_state()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]],
     ...                sample_weight=[1, 0])
@@ -103,14 +103,12 @@ class MeanAbsolutePercentageError(reduction_metrics.MeanMetricWrapper):
         name: (Optional) string name of the metric instance.
         dtype: (Optional) data type of the metric result.
 
-    Example:
-
-    Example:
-
+    Examples:
     >>> m = keras.metrics.MeanAbsolutePercentageError()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
     >>> m.result()
     250000000.0
+
     >>> m.reset_state()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]],
     ...                sample_weight=[1, 0])
@@ -150,14 +148,13 @@ class MeanSquaredLogarithmicError(reduction_metrics.MeanMetricWrapper):
         name: (Optional) string name of the metric instance.
         dtype: (Optional) data type of the metric result.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> m = keras.metrics.MeanSquaredLogarithmicError()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
     >>> m.result()
     0.12011322
+
     >>> m.reset_state()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]],
     ...                sample_weight=[1, 0])
@@ -197,9 +194,7 @@ class RootMeanSquaredError(reduction_metrics.Mean):
         name: (Optional) string name of the metric instance.
         dtype: (Optional) data type of the metric result.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> m = keras.metrics.RootMeanSquaredError()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
@@ -270,9 +265,7 @@ class CosineSimilarity(reduction_metrics.MeanMetricWrapper):
         axis: (Optional) Defaults to `-1`. The dimension along which the cosine
             similarity is computed.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> # l2_norm(y_true) = [[0., 1.], [1./1.414, 1./1.414]]
     >>> # l2_norm(y_pred) = [[1., 0.], [1./1.414, 1./1.414]]
@@ -283,6 +276,7 @@ class CosineSimilarity(reduction_metrics.MeanMetricWrapper):
     >>> m.update_state([[0., 1.], [1., 1.]], [[1., 0.], [1., 1.]])
     >>> m.result()
     0.49999997
+
     >>> m.reset_state()
     >>> m.update_state([[0., 1.], [1., 1.]], [[1., 0.], [1., 1.]],
     ...                sample_weight=[0.3, 0.7])
@@ -323,14 +317,13 @@ class LogCoshError(reduction_metrics.MeanMetricWrapper):
         name: (Optional) string name of the metric instance.
         dtype: (Optional) data type of the metric result.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> m = keras.metrics.LogCoshError()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
     >>> m.result()
     0.10844523
+
     >>> m.reset_state()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]],
     ...                sample_weight=[1, 0])
@@ -515,7 +508,8 @@ class R2Score(reduction_metrics.Metric):
 
         sample_weight = ops.broadcast_to(sample_weight, ops.shape(y_true))
 
-        weighted_y_true = y_true * ops.cast(sample_weight, y_true.dtype)
+        sample_weight = ops.cast(sample_weight, y_true.dtype)
+        weighted_y_true = y_true * sample_weight
         self.sum.assign(self.sum + ops.sum(weighted_y_true, axis=0))
         self.squared_sum.assign(
             self.squared_sum + ops.sum(y_true * weighted_y_true, axis=0)
@@ -523,12 +517,18 @@ class R2Score(reduction_metrics.Metric):
         self.total_mse.assign(
             self.total_mse
             + ops.sum(
-                (y_true - y_pred) ** 2 * ops.cast(sample_weight, y_true.dtype),
+                (y_true - y_pred) ** 2 * sample_weight,
                 axis=0,
             )
         )
         self.count.assign(self.count + ops.sum(sample_weight, axis=0))
-        self.num_samples.assign(self.num_samples + ops.size(y_true))
+        # Count non-zero samples. We count a sample if it has a
+        # non-zero weight in at least one output. This avoids N x K inflation
+        # for multi-output regression and ensures num_samples is an integer.
+        is_nonzero = ops.not_equal(sample_weight, 0.0)
+        nonzero_per_sample = ops.any(is_nonzero, axis=-1)
+        num_samples_update = ops.sum(ops.cast(nonzero_per_sample, self.dtype))
+        self.num_samples.assign_add(num_samples_update)
 
     def result(self):
         mean = self.sum / self.count

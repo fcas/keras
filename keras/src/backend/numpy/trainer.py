@@ -10,6 +10,7 @@ from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import data_adapter_utils
 from keras.src.trainers.epoch_iterator import EpochIterator
 from keras.src.utils import traceback_utils
+from keras.src.utils.python_utils import pythonify_logs
 
 
 class NumpyTrainer(base_trainer.Trainer):
@@ -28,8 +29,8 @@ class NumpyTrainer(base_trainer.Trainer):
             y_pred = self(x, training=False)
         else:
             y_pred = self(x)
-        loss = self.compute_loss(
-            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight
+        loss = self._compute_loss(
+            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
         self._loss_tracker.update_state(
             loss, sample_weight=tree.flatten(x)[0].shape[0]
@@ -73,16 +74,12 @@ class NumpyTrainer(base_trainer.Trainer):
             return self.predict_step(data)
 
         def multi_predict_steps(data):
-            outputs = one_predict_step(data[:1])
-
-            for single_step_data in data[1:]:
-                step_outputs = one_predict_step([single_step_data])
-                outputs = tree.map_structure(
-                    lambda t1, t2: np.concatenate([t1, t2]),
-                    outputs,
-                    step_outputs,
-                )
-            return outputs
+            if len(data) == 1:
+                return one_predict_step(data[:1])
+            all_outputs = [one_predict_step([d]) for d in data]
+            return tree.map_structure(
+                lambda *args: np.concatenate(args, axis=0), *all_outputs
+            )
 
         if self.steps_per_execution > 1:
             predict_step = multi_predict_steps
@@ -97,7 +94,10 @@ class NumpyTrainer(base_trainer.Trainer):
             self._compile_metrics is not None
             and not self._compile_metrics.built
         )
-        if model_unbuilt or compile_metrics_unbuilt:
+        compile_loss_unbuilt = (
+            self._compile_loss is not None and not self._compile_loss.built
+        )
+        if model_unbuilt or compile_metrics_unbuilt or compile_loss_unbuilt:
             # Create symbolic tensors matching an input batch.
 
             def to_symbolic_input(v):
@@ -128,6 +128,15 @@ class NumpyTrainer(base_trainer.Trainer):
                 # Build all metric state with `backend.compute_output_spec`.
                 backend.compute_output_spec(
                     self.compute_metrics,
+                    x,
+                    y,
+                    y_pred,
+                    sample_weight=sample_weight,
+                )
+            if compile_loss_unbuilt:
+                # Build `CompileLoss` state with `backend.compute_output_spec`.
+                backend.compute_output_spec(
+                    self._compute_loss,
                     x,
                     y,
                     y_pred,
@@ -173,7 +182,6 @@ class NumpyTrainer(base_trainer.Trainer):
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
                 callbacks,
-                add_history=True,
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=1,
@@ -200,11 +208,11 @@ class NumpyTrainer(base_trainer.Trainer):
         self.stop_predicting = False
         callbacks.on_predict_begin()
         outputs = None
-        for step, data in epoch_iterator.enumerate_epoch():
-            callbacks.on_predict_batch_begin(step)
+        for begin_step, end_step, data in epoch_iterator:
+            callbacks.on_predict_batch_begin(begin_step)
             batch_outputs = self.predict_function(data)
             outputs = append_to_outputs(batch_outputs, outputs)
-            callbacks.on_predict_batch_end(step, {"outputs": batch_outputs})
+            callbacks.on_predict_batch_end(end_step, {"outputs": batch_outputs})
             if self.stop_predicting:
                 break
         callbacks.on_predict_end()
@@ -244,7 +252,7 @@ class NumpyTrainer(base_trainer.Trainer):
 
         if not all(layer.built for layer in self._flatten_layers()):
             # Build the model on one batch of data.
-            for _, data in epoch_iterator.enumerate_epoch():
+            for _, _, data in epoch_iterator:
                 data_batch = data[0]
                 self._symbolic_build(data_batch)
                 break
@@ -253,7 +261,6 @@ class NumpyTrainer(base_trainer.Trainer):
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
                 callbacks,
-                add_history=True,
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=1,
@@ -264,16 +271,15 @@ class NumpyTrainer(base_trainer.Trainer):
         self.make_test_function()
         self.stop_evaluating = False
         callbacks.on_test_begin()
-        logs = None
+        logs = {}
         self.reset_metrics()
-        for step, data in epoch_iterator.enumerate_epoch():
-            callbacks.on_test_batch_begin(step)
+        for begin_step, end_step, data in epoch_iterator:
+            callbacks.on_test_batch_begin(begin_step)
             logs = self.test_function(data)
-            logs = self._pythonify_logs(logs)
-            callbacks.on_test_batch_end(step, logs)
+            callbacks.on_test_batch_end(end_step, logs)
             if self.stop_evaluating:
                 break
-        logs = self._get_metrics_result_or_logs(logs)
+        logs = pythonify_logs(self._get_metrics_result_or_logs(logs))
         callbacks.on_test_end(logs)
 
         if return_dict:
@@ -308,7 +314,7 @@ class NumpyTrainer(base_trainer.Trainer):
         self.make_test_function()
 
         logs = self.test_function([data])
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = pythonify_logs(logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)

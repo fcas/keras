@@ -1,3 +1,5 @@
+import warnings
+
 from keras.src import backend
 from keras.src import initializers
 from keras.src import ops
@@ -55,8 +57,8 @@ class _IoUBase(Metric):
         sparse_y_pred=True,
         axis=-1,
     ):
-        # defaulting to float32 to avoid issues with confusion matrix
-        super().__init__(name=name, dtype=dtype or "float32")
+        # defaulting to int to avoid issues with confusion matrix
+        super().__init__(name=name, dtype=dtype or "int")
         # Metric should be maximized during optimization.
         self._direction = "up"
         self.num_classes = num_classes
@@ -69,6 +71,7 @@ class _IoUBase(Metric):
             name="total_confusion_matrix",
             shape=(num_classes, num_classes),
             initializer=initializers.Zeros(),
+            dtype=self.dtype,
         )
 
     def update_state(self, y_true, y_pred, sample_weight=None):
@@ -102,7 +105,17 @@ class _IoUBase(Metric):
 
         if sample_weight is None:
             sample_weight = 1
-
+        else:
+            if (
+                hasattr(sample_weight, "dtype")
+                and "float" in str(sample_weight.dtype)
+                and "int" in str(self.dtype)
+            ):
+                warnings.warn(
+                    "You are passing weight as `float`, but dtype is `int`. "
+                    "This may result in an incorrect weight due to type casting"
+                    " Consider using integer weights."
+                )
         sample_weight = ops.convert_to_tensor(sample_weight, dtype=self.dtype)
 
         if len(sample_weight.shape) > 1:
@@ -110,28 +123,47 @@ class _IoUBase(Metric):
 
         sample_weight = ops.broadcast_to(sample_weight, ops.shape(y_true))
 
+        # Build a bounds mask to filter out-of-range class IDs
+        # (>= num_classes or < 0) so they never reach the
+        # confusion matrix. This is graph-safe (no Python ifs
+        # on tensor values).
+        num_cls = ops.convert_to_tensor(self.num_classes, dtype=y_true.dtype)
+        bounds_mask = ops.logical_and(
+            ops.logical_and(
+                ops.greater_equal(y_true, 0),
+                ops.less(y_true, num_cls),
+            ),
+            ops.logical_and(
+                ops.greater_equal(y_pred, 0),
+                ops.less(y_pred, num_cls),
+            ),
+        )
+
         if self.ignore_class is not None:
             ignore_class = ops.convert_to_tensor(
                 self.ignore_class, y_true.dtype
             )
-            valid_mask = ops.not_equal(y_true, ignore_class)
-            y_true = y_true * ops.cast(valid_mask, y_true.dtype)
-            y_pred = y_pred * ops.cast(valid_mask, y_pred.dtype)
-            if sample_weight is not None:
-                sample_weight = sample_weight * ops.cast(
-                    valid_mask, sample_weight.dtype
-                )
+            bounds_mask = ops.logical_and(
+                bounds_mask,
+                ops.not_equal(y_true, ignore_class),
+            )
+
+        y_true = ops.where(bounds_mask, y_true, 0)
+        y_pred = ops.where(bounds_mask, y_pred, 0)
+
+        if sample_weight is not None:
+            sample_weight = ops.where(bounds_mask, sample_weight, 0)
+            sample_weight = ops.cast(sample_weight, dtype=self.dtype)
 
         y_pred = ops.cast(y_pred, dtype=self.dtype)
         y_true = ops.cast(y_true, dtype=self.dtype)
-        sample_weight = ops.cast(sample_weight, dtype=self.dtype)
 
         current_cm = confusion_matrix(
             y_true,
             y_pred,
             self.num_classes,
             weights=sample_weight,
-            dtype="float32",
+            dtype=self.dtype,
         )
 
         return self.total_cm.assign(self.total_cm + current_cm)
@@ -272,16 +304,26 @@ class IoU(_IoUBase):
         denominator = ops.take_along_axis(
             denominator, target_class_ids, axis=-1
         )
+        denominator = ops.cast(denominator, dtype="float32")
+        true_positives = ops.cast(true_positives, dtype="float32")
 
         # If the denominator is 0, we need to ignore the class.
-        num_valid_entries = ops.sum(
-            ops.cast(ops.greater(denominator, 1e-9), dtype=self.dtype)
+        valid_entries = ops.cast(
+            ops.greater(denominator, 1e-9), dtype="float32"
         )
+        num_valid_entries = ops.sum(valid_entries)
 
-        iou = ops.divide(true_positives, denominator + backend.epsilon())
+        iou = ops.divide(
+            true_positives,
+            denominator + backend.epsilon(),
+        )
+        # Zero out IoU for absent classes so they
+        # contribute 0.0, not ~1.0.
+        iou = ops.where(valid_entries, iou, 0.0)
 
         return ops.divide(
-            ops.sum(iou, axis=self.axis), num_valid_entries + backend.epsilon()
+            ops.sum(iou, axis=self.axis),
+            num_valid_entries + backend.epsilon(),
         )
 
     def get_config(self):
@@ -337,8 +379,6 @@ class BinaryIoU(IoU):
             or predicted class 1 if the logit is above `threshold`.
         name: (Optional) string name of the metric instance.
         dtype: (Optional) data type of the metric result.
-
-    Example:
 
     Example:
 
@@ -406,7 +446,8 @@ class BinaryIoU(IoU):
             Update op.
         """
         y_true = ops.convert_to_tensor(y_true, dtype=self.dtype)
-        y_pred = ops.convert_to_tensor(y_pred, dtype=self.dtype)
+        # convert y_pred on float 32 and cast just after to dtype
+        y_pred = ops.convert_to_tensor(y_pred, dtype="float32")
         y_pred = ops.cast(y_pred >= self.threshold, self.dtype)
         return super().update_state(y_true, y_pred, sample_weight)
 
@@ -459,7 +500,6 @@ class MeanIoU(IoU):
             is used to determine each sample's most likely associated label.
         axis: (Optional) The dimension containing the logits. Defaults to `-1`.
 
-    Example:
 
     Example:
 
@@ -572,7 +612,6 @@ class OneHotIoU(IoU):
             is used to determine each sample's most likely associated label.
         axis: (Optional) The dimension containing the logits. Defaults to `-1`.
 
-    Example:
 
     Example:
 
@@ -688,7 +727,6 @@ class OneHotMeanIoU(MeanIoU):
             associated label.
         axis: (Optional) The dimension containing the logits. Defaults to `-1`.
 
-    Example:
 
     Example:
 

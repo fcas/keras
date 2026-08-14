@@ -59,13 +59,18 @@ def load_data():
     assert y_train.shape == (50000, 1)
     assert y_test.shape == (10000, 1)
     ```
+
+    **Note**: The CIFAR-10 dataset is known to have a small percentage of
+    mislabeled samples, which is inherent to the original dataset. This label
+    noise may impact training and evaluation. For more details, refer to
+    discussions in the research literature on CIFAR-10 label quality.
     """
-    dirname = "cifar-10-batches-py"
+    dirname = "cifar-10-batches-py-target"
     origin = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
     path = get_file(
         fname=dirname,
         origin=origin,
-        untar=True,
+        extract=True,
         file_hash=(  # noqa: E501
             "6d958be074577803d12ecdefd02955f39262c83c16fe9348329d7fe0b5c001ce"
         ),
@@ -76,8 +81,10 @@ def load_data():
     x_train = np.empty((num_train_samples, 3, 32, 32), dtype="uint8")
     y_train = np.empty((num_train_samples,), dtype="uint8")
 
+    # batches are within an inner folder
+    path = os.path.join(path, "cifar-10-batches-py")
     for i in range(1, 6):
-        fpath = os.path.join(path, "data_batch_" + str(i))
+        fpath = os.path.join(path, f"data_batch_{i}")
         (
             x_train[(i - 1) * 10000 : i * 10000, :, :, :],
             y_train[(i - 1) * 10000 : i * 10000],

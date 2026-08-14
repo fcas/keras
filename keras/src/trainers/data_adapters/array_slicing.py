@@ -6,19 +6,7 @@ import numpy as np
 from keras.src import backend
 from keras.src import tree
 from keras.src.trainers.data_adapters import data_adapter_utils
-
-try:
-    import pandas
-except ImportError:
-    pandas = None
-
-
-# Leave jax, tf, and torch arrays off this list. Instead we will use
-# `__array__` to detect these types. Doing so allows us to avoid importing a
-# backend framework we are not currently using just to do type-checking.
-ARRAY_TYPES = (np.ndarray,)
-if pandas:
-    ARRAY_TYPES = ARRAY_TYPES + (pandas.Series, pandas.DataFrame)
+from keras.src.utils.module_utils import tensorflow as tf
 
 
 class Sliceable:
@@ -91,8 +79,7 @@ class Sliceable:
     def convert_to_jax_compatible(cls, x):
         """Convert a tensor to something that the JAX backend can consume.
 
-        This can be a `JAX` array, NumPy array or any other type of tensor that
-        `keras.backend.jax.core.convert_to_tensor()` can consume.
+        This can be a `JAX` array, `JAXSparse` or a NumPy array.
         Only called after slicing using `__getitem__`.
         Used to convert sparse tensors and densify ragged tensors.
 
@@ -147,7 +134,7 @@ class TensorflowSliceable(Sliceable):
 class TensorflowRaggedSliceable(TensorflowSliceable):
     @classmethod
     def convert_to_jax_compatible(cls, x):
-        return x.to_tensor()
+        return cls.convert_to_numpy(x)
 
     @classmethod
     def convert_to_torch_compatible(cls, x):
@@ -180,7 +167,7 @@ class TensorflowSparseSliceable(TensorflowSliceable):
         return tf_sparse.sparse_to_dense(x)
 
 
-class JaxSliceable(Sliceable):
+class JaxSparseSliceable(Sliceable):
     def __getitem__(self, indices):
         return self.array[indices, ...]
 
@@ -190,8 +177,6 @@ class JaxSliceable(Sliceable):
 
         return convert_to_numpy(x)
 
-
-class JaxSparseSliceable(JaxSliceable):
     @classmethod
     def convert_to_tf_dataset_compatible(cls, array):
         return to_tensorflow_sparse_wrapper(
@@ -297,7 +282,7 @@ def to_tensorflow_sparse_wrapper(sparse):
 
     row_ids = sparse.indices[:, 0]
     row_splits = tf.experimental.RowPartition.from_value_rowids(
-        row_ids
+        row_ids, nrows=sparse.dense_shape[0]
     ).row_splits()
 
     ragged_indices = tf.cast(
@@ -340,11 +325,13 @@ def slice_tensorflow_sparse_wrapper(sparse_wrapper, indices):
 def can_slice_array(x):
     return (
         x is None
-        or isinstance(x, ARRAY_TYPES)
+        or isinstance(x, np.ndarray)
         or data_adapter_utils.is_tensorflow_tensor(x)
         or data_adapter_utils.is_jax_array(x)
         or data_adapter_utils.is_torch_tensor(x)
         or data_adapter_utils.is_scipy_sparse(x)
+        or data_adapter_utils.is_pandas_data_frame(x)
+        or data_adapter_utils.is_pandas_series(x)
         or hasattr(x, "__array__")
     )
 
@@ -372,6 +359,15 @@ def convert_to_sliceable(arrays, target_backend=None):
         if x is None:
             return x
 
+        # Special case: handle np "object" arrays containing strings
+        if (
+            isinstance(x, np.ndarray)
+            and str(x.dtype) == "object"
+            and backend.backend() == "tensorflow"
+            and all(isinstance(e, str) for e in x)
+        ):
+            x = tf.convert_to_tensor(x, dtype="string")
+
         # Step 1. Determine which Sliceable class to use.
         if isinstance(x, np.ndarray):
             sliceable_class = NumpySliceable
@@ -386,12 +382,13 @@ def convert_to_sliceable(arrays, target_backend=None):
             if data_adapter_utils.is_jax_sparse(x):
                 sliceable_class = JaxSparseSliceable
             else:
-                sliceable_class = JaxSliceable
+                x = np.asarray(x)
+                sliceable_class = NumpySliceable
         elif data_adapter_utils.is_torch_tensor(x):
             sliceable_class = TorchSliceable
-        elif pandas is not None and isinstance(x, pandas.DataFrame):
+        elif data_adapter_utils.is_pandas_data_frame(x):
             sliceable_class = PandasDataFrameSliceable
-        elif pandas is not None and isinstance(x, pandas.Series):
+        elif data_adapter_utils.is_pandas_series(x):
             sliceable_class = PandasSeriesSliceable
         elif data_adapter_utils.is_scipy_sparse(x):
             sliceable_class = ScipySparseSliceable
@@ -410,13 +407,13 @@ def convert_to_sliceable(arrays, target_backend=None):
         # Step 2. Normalize floats to floatx.
         def is_non_floatx_float(dtype):
             return (
-                not dtype == object
+                dtype is not object
                 and backend.is_float_dtype(dtype)
                 and not backend.standardize_dtype(dtype) == backend.floatx()
             )
 
         cast_dtype = None
-        if pandas is not None and isinstance(x, pandas.DataFrame):
+        if data_adapter_utils.is_pandas_data_frame(x):
             if any(is_non_floatx_float(d) for d in x.dtypes.values):
                 cast_dtype = backend.floatx()
         else:
@@ -433,14 +430,14 @@ def convert_to_sliceable(arrays, target_backend=None):
         if target_backend == "tensorflow":
             return sliceable_class.convert_to_tf_dataset_compatible(x)
 
-        # With dense arrays, with JAX as either input or output, it is faster to
-        # use NumPy as an intermediary representation, so wrap input array in a
-        # NumPy array, which should not use extra memory. For the input case,
-        # see https://github.com/google/jax/issues/1276 for an explanation of
+        # With dense arrays and JAX as output, it is faster to use NumPy as an
+        # intermediary representation, so wrap input array in a NumPy array,
+        # which should not use extra memory.
+        # See https://github.com/google/jax/issues/1276 for an explanation of
         # why slicing a NumPy array is faster than slicing a JAX array.
-        if sliceable_class == JaxSliceable or (
-            target_backend == "jax"
-            and sliceable_class in (TensorflowSliceable, TorchSliceable)
+        if target_backend == "jax" and sliceable_class in (
+            TensorflowSliceable,
+            TorchSliceable,
         ):
             x = np.asarray(x)
             sliceable_class = NumpySliceable

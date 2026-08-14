@@ -3,6 +3,7 @@ import pytest
 
 from keras.src import backend
 from keras.src import ops
+from keras.src import random
 from keras.src import testing
 from keras.src.random import seed_generator
 
@@ -37,6 +38,15 @@ class SeedGeneratorTest(testing.TestCase):
         seed2 = seed_generator.make_default_seed()
         self.assertNotEqual(seed1, seed2)
 
+    def test_seed_generator_dtype(self):
+        gen = seed_generator.SeedGenerator(seed=42)
+        self.assertEqual(gen.state.dtype, backend.random_seed_dtype())
+        seed = gen.next()
+        self.assertEqual(gen.state.dtype, backend.random_seed_dtype())
+        self.assertEqual(
+            backend.standardize_dtype(seed.dtype), backend.random_seed_dtype()
+        )
+
     def test_draw_seed_from_seed_generator(self):
         gen = seed_generator.SeedGenerator(seed=42)
         seed1 = seed_generator.draw_seed(gen)
@@ -45,6 +55,23 @@ class SeedGeneratorTest(testing.TestCase):
     def test_draw_seed_from_integer(self):
         seed2 = seed_generator.draw_seed(12345)
         self.assertTrue(backend.is_tensor(seed2))
+        self.assertEqual(
+            backend.standardize_dtype(seed2.dtype), backend.random_seed_dtype()
+        )
+
+    def test_draw_seed_from_large_integer(self):
+        # Seeds at int32 boundaries must not cause overflow or sign-flip errors.
+        # 2**31 is where signed-int32 wraps; 2**32 - 1 is the max uint32 value.
+        for s in [2**31 - 1, 2**31, 2**32 - 1]:
+            seed = seed_generator.draw_seed(s)
+            self.assertTrue(backend.is_tensor(seed))
+            self.assertEqual(
+                backend.standardize_dtype(seed.dtype),
+                backend.random_seed_dtype(),
+            )
+            # Verify the seed can be consumed by a random op without error.
+            res = random.uniform((2, 2), seed=s)
+            self.assertEqual(res.shape, (2, 2))
 
     def test_draw_seed_from_none(self):
         seed3 = seed_generator.draw_seed(None)
@@ -79,5 +106,5 @@ class SeedGeneratorTest(testing.TestCase):
             traced_function()
 
     def test_seed_generator_serialization(self):
-        random_generator = seed_generator.SeedGenerator(seed=42)
+        random_generator = seed_generator.SeedGenerator(seed=42, name="sg")
         self.run_class_serialization_test(random_generator)

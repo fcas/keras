@@ -51,7 +51,7 @@ class Adadelta(optimizer.Optimizer):
         ema_overwrite_frequency=None,
         loss_scale_factor=None,
         gradient_accumulation_steps=None,
-        name="adadelta",
+        name=None,
         **kwargs,
     ):
         super().__init__(
@@ -75,15 +75,11 @@ class Adadelta(optimizer.Optimizer):
         if self.built:
             return
         super().build(var_list)
-        self._accumulated_grads = []
-        self._accumulated_delta_vars = []
-        for var in var_list:
-            self._accumulated_grads.append(
-                self.add_variable_from_reference(var, "accumulated_grad")
+        self._accumulated_grads, self._accumulated_delta_vars = (
+            self.add_optimizer_variables(
+                var_list, ["accumulated_grad", "accumulated_delta_var"]
             )
-            self._accumulated_delta_vars.append(
-                self.add_variable_from_reference(var, "accumulated_delta_var")
-            )
+        )
 
     def update_step(self, grad, variable, learning_rate):
         """Update step given gradient and the associated model variable."""
@@ -134,6 +130,7 @@ class Adadelta(optimizer.Optimizer):
         return config
 
 
-Adadelta.__doc__ = Adadelta.__doc__.replace(
-    "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
-)
+if Adadelta.__doc__ is not None:
+    Adadelta.__doc__ = Adadelta.__doc__.replace(
+        "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
+    )

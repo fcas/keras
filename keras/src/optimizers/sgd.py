@@ -54,7 +54,7 @@ class SGD(optimizer.Optimizer):
         ema_overwrite_frequency=None,
         loss_scale_factor=None,
         gradient_accumulation_steps=None,
-        name="SGD",
+        name=None,
         **kwargs,
     ):
         super().__init__(
@@ -90,12 +90,7 @@ class SGD(optimizer.Optimizer):
         super().build(variables)
         self.momentums = []
         if self.momentum != 0:
-            for variable in variables:
-                self.momentums.append(
-                    self.add_variable_from_reference(
-                        reference_variable=variable, name="momentum"
-                    )
-                )
+            self.momentums = self.add_optimizer_variables(variables, "momentum")
 
     def update_step(self, gradient, variable, learning_rate):
         """Update step given gradient and the associated model variable."""
@@ -138,6 +133,7 @@ class SGD(optimizer.Optimizer):
         return config
 
 
-SGD.__doc__ = SGD.__doc__.replace(
-    "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
-)
+if SGD.__doc__ is not None:
+    SGD.__doc__ = SGD.__doc__.replace(
+        "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
+    )

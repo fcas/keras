@@ -8,7 +8,9 @@ from keras.src.backend.numpy.core import convert_to_tensor
 from keras.src.utils.module_utils import scipy
 
 
-def segment_sum(data, segment_ids, num_segments=None, sorted=False):
+def _segment_reduction_fn(
+    data, segment_ids, reduction_method, num_segments, sorted
+):
     if num_segments is None:
         num_segments = np.amax(segment_ids) + 1
 
@@ -21,93 +23,99 @@ def segment_sum(data, segment_ids, num_segments=None, sorted=False):
         num_segments  # Replace first dimension (which corresponds to segments)
     )
 
-    if sorted:
+    if reduction_method == np.maximum:
+        result = np.ones(data_shape, dtype=valid_data.dtype) * -np.inf
+    elif reduction_method == np.minimum:
+        result = np.ones(data_shape, dtype=valid_data.dtype) * np.inf
+    elif reduction_method == np.multiply:
+        result = np.ones(data_shape, dtype=valid_data.dtype)
+    else:
         result = np.zeros(data_shape, dtype=valid_data.dtype)
-        np.add.at(result, valid_segment_ids, valid_data)
+
+    if sorted:
+        reduction_method.at(result, valid_segment_ids, valid_data)
     else:
         sort_indices = np.argsort(valid_segment_ids)
         sorted_segment_ids = valid_segment_ids[sort_indices]
         sorted_data = valid_data[sort_indices]
 
-        result = np.zeros(data_shape, dtype=valid_data.dtype)
-        np.add.at(result, sorted_segment_ids, sorted_data)
+        reduction_method.at(result, sorted_segment_ids, sorted_data)
 
     return result
+
+
+def segment_sum(data, segment_ids, num_segments=None, sorted=False):
+    return _segment_reduction_fn(
+        data, segment_ids, np.add, num_segments, sorted
+    )
 
 
 def segment_max(data, segment_ids, num_segments=None, sorted=False):
-    if num_segments is None:
-        num_segments = np.amax(segment_ids) + 1
-
-    valid_indices = segment_ids >= 0  # Ignore segment_ids that are -1
-    valid_data = data[valid_indices]
-    valid_segment_ids = segment_ids[valid_indices]
-
-    data_shape = list(valid_data.shape)
-    data_shape[0] = (
-        num_segments  # Replace first dimension (which corresponds to segments)
+    return _segment_reduction_fn(
+        data, segment_ids, np.maximum, num_segments, sorted
     )
 
-    if sorted:
-        result = np.zeros(data_shape, dtype=valid_data.dtype)
-        np.maximum.at(result, valid_segment_ids, valid_data)
-    else:
-        sort_indices = np.argsort(valid_segment_ids)
-        sorted_segment_ids = valid_segment_ids[sort_indices]
-        sorted_data = valid_data[sort_indices]
 
-        result = np.zeros(data_shape, dtype=valid_data.dtype)
-        np.maximum.at(result, sorted_segment_ids, sorted_data)
-
-    return result
+def segment_min(data, segment_ids, num_segments=None, sorted=False):
+    return _segment_reduction_fn(
+        data, segment_ids, np.minimum, num_segments, sorted
+    )
 
 
-def top_k(x, k, sorted=False):
-    sorted_indices = np.argsort(x, axis=-1)[..., ::-1]
-    sorted_values = np.sort(x, axis=-1)[..., ::-1]
+def segment_prod(data, segment_ids, num_segments=None, sorted=False):
+    return _segment_reduction_fn(
+        data, segment_ids, np.multiply, num_segments, sorted
+    )
 
-    if sorted:
-        # Take the k largest values.
-        top_k_values = sorted_values[..., :k]
-        top_k_indices = sorted_indices[..., :k]
-    else:
+
+def top_k(x, k, sorted=True, is_stable=True):
+    if not is_stable and not sorted:
         # Partition the array such that all values larger than the k-th
         # largest value are to the right of it.
-        top_k_values = np.partition(x, -k, axis=-1)[..., -k:]
         top_k_indices = np.argpartition(x, -k, axis=-1)[..., -k:]
-
-        # Get the indices in sorted order.
-        idx = np.argsort(-top_k_values, axis=-1)
-
-        # Get the top k values and their indices.
-        top_k_values = np.take_along_axis(top_k_values, idx, axis=-1)
-        top_k_indices = np.take_along_axis(top_k_indices, idx, axis=-1)
-
-    return top_k_values, top_k_indices
+        top_k_values = np.take_along_axis(x, top_k_indices, axis=-1)
+        return top_k_values, top_k_indices
+    if not is_stable and sorted:
+        # Take the k largest values.
+        sorted_indices = np.argsort(x, axis=-1)[..., ::-1]
+        sorted_values = np.take_along_axis(x, sorted_indices, axis=-1)
+        return sorted_values[..., :k], sorted_indices[..., :k]
+    # Universal Reverse-Argsort-Reverse stable sort:
+    x_rev = np.flip(x, axis=-1)
+    rev_indices = np.argsort(x_rev, axis=-1, kind="stable")[..., ::-1]
+    orig_indices = x.shape[-1] - 1 - rev_indices
+    values = np.take_along_axis(x, orig_indices, axis=-1)
+    return values[..., :k], orig_indices[..., :k]
 
 
 def in_top_k(targets, predictions, k):
-    targets = targets[:, None]
-    topk_values = top_k(predictions, k)[0]
+    targets = targets[..., None]
+    topk_values = top_k(predictions, k, sorted=False, is_stable=False)[0]
     targets_values = np.take_along_axis(predictions, targets, axis=-1)
     mask = targets_values >= topk_values
     return np.any(mask, axis=-1)
 
 
 def logsumexp(x, axis=None, keepdims=False):
-    max_x = np.max(x, axis=axis, keepdims=True)
-    result = np.log(np.sum(np.exp(x - max_x), axis=axis, keepdims=True)) + max_x
-    return np.squeeze(result) if not keepdims else result
+    x = convert_to_tensor(x)
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.logsumexp(x, axis=axis, keepdims=keepdims).astype(
+        dtype
+    )
 
 
-def qr(x, mode="reduced"):
-    if mode not in {"reduced", "complete"}:
-        raise ValueError(
-            "`mode` argument value not supported. "
-            "Expected one of {'reduced', 'complete'}. "
-            f"Received: mode={mode}"
-        )
-    return np.linalg.qr(x, mode=mode)
+def cdist(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    dtype = dtypes.result_type(x.dtype, y.dtype, float)
+    x = x.astype(dtype)
+    y = y.astype(dtype)
+    if x.ndim < 2 or y.ndim < 2:
+        raise ValueError("`cdist` inputs must have rank >= 2")
+    if x.shape[-1] != y.shape[-1]:
+        raise ValueError("Last dimension of inputs to `cdist` must match")
+    diff = x[..., :, None, :] - y[..., None, :, :]
+    return np.sqrt(np.sum(diff * diff, axis=-1))
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -161,6 +169,12 @@ def fft(x):
 def fft2(x):
     real, imag = jax_fft2(x)
     return np.array(real), np.array(imag)
+
+
+def ifft2(x):
+    complex_input = _get_complex_tensor_from_tuple(x)
+    complex_output = np.fft.ifft2(complex_input)
+    return np.real(complex_output), np.imag(complex_output)
 
 
 def rfft(x, fft_length=None):
@@ -295,35 +309,43 @@ def istft(
     if length is not None:
         end = start + length
     elif center is True:
-        end = -(fft_length // 2)
+        end = expected_output_len - (fft_length // 2)
     else:
         end = expected_output_len
     return x[..., start:end]
 
 
 def rsqrt(x):
-    return 1.0 / np.sqrt(x)
+    dtype = dtypes.result_type(x.dtype)
+    return (1.0 / np.sqrt(x)).astype(dtype)
 
 
 def erf(x):
-    return np.array(scipy.special.erf(x))
+    dtype = dtypes.result_type(x.dtype)
+    return scipy.special.erf(x).astype(dtype)
+
+
+def erfc(x):
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.erfc(x).astype(dtype)
 
 
 def erfinv(x):
-    return np.array(scipy.special.erfinv(x))
-
-
-def solve(a, b):
-    a = convert_to_tensor(a)
-    b = convert_to_tensor(b)
-    return np.linalg.solve(a, b)
-
-
-def norm(x, ord=None, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    dtype = standardize_dtype(x.dtype)
-    if "int" in dtype or dtype == "bool":
-        dtype = dtypes.result_type(x.dtype, "float32")
-    return np.linalg.norm(x, ord=ord, axis=axis, keepdims=keepdims).astype(
-        dtype
-    )
+    dtype = dtypes.result_type(x.dtype, float)
+    return scipy.special.erfinv(x).astype(dtype)
+
+
+def logdet(x):
+    from keras.src.backend.numpy.numpy import slogdet
+
+    # In NumPy slogdet is more stable than `np.log(np.linalg.det(x))`. See
+    # https://numpy.org/doc/stable/reference/generated/numpy.linalg.slogdet.html
+    return slogdet(x)[1]
+
+
+def gammainc(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+    return scipy.special.gammainc(x1, x2).astype(dtype)

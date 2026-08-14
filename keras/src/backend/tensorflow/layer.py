@@ -1,3 +1,5 @@
+import collections
+
 import tensorflow as tf
 
 from keras.src import tree
@@ -13,7 +15,6 @@ class TFLayer(KerasAutoTrackable):
         self._saved_model_arg_spec = None
         self._tracked = []
 
-    @tf.__internal__.tracking.no_automatic_dependency_tracking
     def _set_save_spec(self, inputs, args=None, kwargs=None):
         """Defines the save spec so that serialization can trace layer calls.
 
@@ -45,6 +46,7 @@ class TFLayer(KerasAutoTrackable):
             kwargs_spec,
         )
 
+    @tf.__internal__.tracking.no_automatic_dependency_tracking
     def _trackable_children(self, save_type="checkpoint", **kwargs):
         if save_type == "savedmodel":
             # SavedModel needs to ignore the execution functions.
@@ -62,16 +64,52 @@ class TFLayer(KerasAutoTrackable):
             self.test_function = test_function
             self.predict_function = predict_function
 
-            for tracked_attr in self._tracked:
-                tracked_item = getattr(self, tracked_attr)
-                if isinstance(tracked_item, tracking.TrackedList):
-                    children[tracked_attr] = list(tracked_item)
-                if isinstance(tracked_item, tracking.TrackedDict):
-                    children[tracked_attr] = dict(tracked_item)
-                if isinstance(tracked_item, tracking.TrackedSet):
-                    children[tracked_attr] = list(tracked_item)
+            # Convert Keras tracked collections to plain Python structures
+            # without creating TensorFlow trackable dependencies
+            self._convert_tracked_collections(children)
 
         return children
+
+    def _convert_tracked_collections(self, children):
+        """Convert TrackedList/Dict/Set to plain Python structures."""
+        for tracked_attr in self._tracked:
+            tracked_item = getattr(self, tracked_attr)
+            if isinstance(tracked_item, tracking.TrackedList):
+                children[tracked_attr] = list(tracked_item)
+            elif isinstance(tracked_item, tracking.TrackedOrderedDict):
+                children[tracked_attr] = collections.OrderedDict(tracked_item)
+            elif isinstance(tracked_item, tracking.TrackedDict):
+                children[tracked_attr] = dict(tracked_item)
+            elif isinstance(tracked_item, tracking.TrackedSet):
+                children[tracked_attr] = list(tracked_item)
+
+    def _get_save_spec(self, dynamic_batch=True):
+        """Compatibility shim for TensorFlow saving utilities.
+
+        TensorFlow's SavedModel / TFLite export paths (e.g.,
+        tf.lite.TFLiteConverter.from_keras_model) expect a `_get_save_spec`
+        method on models. This method generates TensorSpec objects
+        describing the model's input signature.
+
+        Args:
+            dynamic_batch: whether to set the batch dimension to `None`.
+
+        Returns:
+            A TensorSpec, list or dict mirroring the model inputs, or
+            `None` when specs cannot be inferred.
+        """
+        # Lazy import to avoid circular dependency
+        from keras.src.export.export_utils import make_tf_tensor_spec
+
+        # Fall back to building specs from `self.inputs`
+        inputs = getattr(self, "inputs", None)
+        if inputs is None:
+            return None
+
+        return tree.map_structure(
+            lambda x: make_tf_tensor_spec(x, dynamic_batch=dynamic_batch),
+            inputs,
+        )
 
     @property
     def _default_save_signature(self):
@@ -94,26 +132,18 @@ class TFLayer(KerasAutoTrackable):
             inputs = self.input
 
         if inputs is not None:
-            input_signature = [
+            input_signature = (
                 tree.map_structure(
-                    lambda x: tf.TensorSpec(x.shape, self.compute_dtype),
-                    inputs,
-                )
-            ]
+                    lambda x: tf.TensorSpec(x.shape, x.dtype), inputs
+                ),
+            )
         else:
-            shapes_dict = self._build_shapes_dict
-            if len(shapes_dict) == 1:
-                input_shape = tuple(shapes_dict.values())[0]
-                input_signature = [
-                    tf.TensorSpec(input_shape, self.compute_dtype)
-                ]
-            else:
-                input_signature = [
-                    tree.map_structure(
-                        lambda x: tf.TensorSpec(x.shape, self.compute_dtype),
-                        shapes_dict,
-                    )
-                ]
+            input_signature = tuple(
+                tree.map_shape_structure(
+                    lambda s: tf.TensorSpec(s, self.input_dtype), value
+                )
+                for value in self._build_shapes_dict.values()
+            )
 
         @tf.function(input_signature=input_signature)
         def serving_default(inputs):

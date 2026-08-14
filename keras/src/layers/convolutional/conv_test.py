@@ -1,3 +1,4 @@
+import math
 import os
 
 import numpy as np
@@ -9,6 +10,7 @@ from keras.src import backend
 from keras.src import constraints
 from keras.src import layers
 from keras.src import models
+from keras.src import ops
 from keras.src import saving
 from keras.src import testing
 
@@ -276,7 +278,7 @@ def np_conv3d(
     return out
 
 
-class ConvBasicTest(testing.TestCase, parameterized.TestCase):
+class ConvBasicTest(testing.TestCase):
     @parameterized.parameters(
         {
             "filters": 5,
@@ -323,7 +325,6 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
             "output_shape": (3, 2, 6),
         },
     )
-    @pytest.mark.requires_trainable_backend
     def test_conv1d_basic(
         self,
         filters,
@@ -390,7 +391,6 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
             "output_shape": (3, 2, 4, 6),
         },
     )
-    @pytest.mark.requires_trainable_backend
     def test_conv2d_basic(
         self,
         filters,
@@ -457,7 +457,6 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
             "output_shape": (3, 2, 4, 2, 6),
         },
     )
-    @pytest.mark.requires_trainable_backend
     def test_conv3d_basic(
         self,
         filters,
@@ -654,6 +653,9 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
         self.assertLen(layer.non_trainable_weights, 1)
         if backend.backend() == "torch":
             self.assertLen(layer.torch_params, 4)
+        self.assertDType(layer.lora_kernel_a, "float32")
+        self.assertDType(layer.lora_kernel_b, "float32")
+
         # Try eager call
         x = np.random.random((64,) + input_shape[1:])
         y = np.random.random((64,) + output_shape[1:])
@@ -715,9 +717,7 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
         model.load_weights(temp_filepath)
         self.assertAllClose(model.predict(x), new_model.predict(x))
 
-    @pytest.mark.requires_trainable_backend
     def test_lora_weight_name(self):
-
         class MyModel(models.Model):
             def __init__(self):
                 super().__init__(name="mymodel")
@@ -736,7 +736,55 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
             model.conv2d.lora_kernel_a.path, "mymodel/conv2d/lora_kernel_a"
         )
 
-    @pytest.mark.requires_trainable_backend
+    def test_enable_lora_with_alpha(self):
+        # Create a `Conv2D` layer with a small kernel for simplicity.
+        layer = layers.Conv2D(filters=3, kernel_size=(2, 2), padding="valid")
+        # Use a fixed input shape: batch size 1, height=4, width=4, channels=3.
+        input_shape = (1, 4, 4, 3)
+        layer.build(input_shape)
+
+        # Set the base kernel to known, deterministic values.
+        base_kernel = np.linspace(
+            0, 1, num=math.prod(layer.kernel.shape), dtype=np.float32
+        )
+        base_kernel = base_kernel.reshape(layer.kernel.shape)
+        layer.kernel.assign(base_kernel)
+
+        # Enable LoRA with `rank`=2 and a custom `lora_alpha` value (e.g. 3.0).
+        layer.enable_lora(rank=2, lora_alpha=3.0)
+        self.assertEqual(layer.lora_rank, 2)
+        self.assertEqual(layer.lora_alpha, 3.0)
+
+        # For `Conv2D`, assume the LoRA weights have shapes:
+        #   `lora_kernel_a`: (kernel_height, kernel_width, in_channels, rank)
+        #   `lora_kernel_b`: (rank, out_channels)
+        lora_a_shape = layer.lora_kernel_a.shape
+        lora_b_shape = layer.lora_kernel_b.shape
+
+        # Assign known constant values to LoRA weights.
+        lora_a = np.full(lora_a_shape, 0.1, dtype=np.float32)
+        lora_b = np.full(lora_b_shape, 0.2, dtype=np.float32)
+        layer.lora_kernel_a.assign(lora_a)
+        layer.lora_kernel_b.assign(lora_b)
+
+        # Compute the expected delta.
+        # Flatten `lora_kernel_a` to shape (-1, `rank`),
+        # multiply with `lora_kernel_b`,
+        # then reshape to the kernel's shape.
+        scaling = 3.0 / 2  # `lora_alpha / lora_rank`
+        delta = np.matmul(lora_a.reshape(-1, 2), lora_b)
+        delta = delta.reshape(base_kernel.shape)
+        expected_effective_kernel = base_kernel + scaling * delta
+
+        # Compare the effective kernel computed via the property.
+        actual_effective_kernel = ops.convert_to_numpy(layer.kernel)
+        self.assertAllClose(
+            actual_effective_kernel,
+            expected_effective_kernel,
+            tpu_atol=1e-3,
+            tpu_rtol=1e-3,
+        )
+
     def test_lora_rank_argument(self):
         self.run_layer_test(
             layers.Conv2D,
@@ -757,8 +805,26 @@ class ConvBasicTest(testing.TestCase, parameterized.TestCase):
             supports_masking=False,
         )
 
+    @parameterized.parameters(
+        (layers.Conv1D, (10, 3), 2, 10),
+        (layers.Conv2D, (10, 10, 3), (2, 2), (10, 10)),
+        (layers.Conv3D, (10, 10, 10, 3), (2, 2, 2), (10, 10, 10)),
+    )
+    def test_conv_symbolic_invalid_configuration(
+        self, layer_cls, input_shape, kernel_size, dilation_rate
+    ):
+        inputs = layers.Input(shape=input_shape)
+        layer = layer_cls(
+            filters=1,
+            kernel_size=kernel_size,
+            dilation_rate=dilation_rate,
+        )
 
-class ConvCorrectnessTest(testing.TestCase, parameterized.TestCase):
+        with self.assertRaises(ValueError):
+            layer(inputs)
+
+
+class ConvCorrectnessTest(testing.TestCase):
     @parameterized.parameters(
         {
             "filters": 5,
@@ -846,7 +912,7 @@ class ConvCorrectnessTest(testing.TestCase, parameterized.TestCase):
             dilation_rate=dilation_rate,
             groups=groups,
         )
-        self.assertAllClose(outputs, expected)
+        self.assertAllClose(outputs, expected, tpu_atol=1e-1, tpu_rtol=1e-1)
 
     @parameterized.parameters(
         {
@@ -944,7 +1010,9 @@ class ConvCorrectnessTest(testing.TestCase, parameterized.TestCase):
             dilation_rate=dilation_rate,
             groups=groups,
         )
-        self.assertAllClose(outputs, expected, rtol=5e-4)
+        self.assertAllClose(
+            outputs, expected, rtol=5e-4, tpu_atol=1e-1, tpu_rtol=1e-1
+        )
 
     @parameterized.parameters(
         {
@@ -1033,7 +1101,9 @@ class ConvCorrectnessTest(testing.TestCase, parameterized.TestCase):
             dilation_rate=dilation_rate,
             groups=groups,
         )
-        self.assertAllClose(outputs, expected, rtol=1e-3)
+        self.assertAllClose(
+            outputs, expected, rtol=1e-3, tpu_atol=1e-1, tpu_rtol=1e-1
+        )
 
     def test_conv_constraints(self):
         layer = layers.Conv2D(
@@ -1050,3 +1120,11 @@ class ConvCorrectnessTest(testing.TestCase, parameterized.TestCase):
         )
         layer.build((None, 5, 5, 3))
         self.assertIsInstance(layer.bias.constraint, constraints.NonNeg)
+
+    def test_conv_raises_exception_on_zero_dims(self):
+        x = np.random.rand(3, 4, 4, 4)
+        l = layers.Conv2D(6, [5, 5], 1, "valid")
+        # The exception type can vary across backends (e.g., ValueError,
+        # tf.errors.InvalidArgumentError, RuntimeError).
+        with self.assertRaises(Exception):
+            l(x)

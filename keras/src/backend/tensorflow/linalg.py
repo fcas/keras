@@ -7,10 +7,23 @@ from keras.src.backend.tensorflow.core import cast
 from keras.src.backend.tensorflow.core import convert_to_tensor
 
 
-def cholesky(a):
+def cholesky(a, upper=False):
     out = tf.linalg.cholesky(a)
     # tf.linalg.cholesky simply returns NaNs for non-positive definite matrices
-    return tf.debugging.check_numerics(out, "Cholesky")
+    out = tf.debugging.check_numerics(out, "Cholesky")
+    if upper:
+        return tf.linalg.adjoint(out)
+    return out
+
+
+def cholesky_inverse(a, upper=False):
+    identity = tf.eye(num_rows=tf.shape(a)[-1], dtype=a.dtype)
+    inv_chol = tf.linalg.triangular_solve(a, identity, lower=not upper)
+    if upper:
+        a_inv = tf.matmul(inv_chol, inv_chol, transpose_b=True)
+    else:
+        a_inv = tf.matmul(inv_chol, inv_chol, transpose_a=True)
+    return a_inv
 
 
 def det(a):
@@ -169,7 +182,7 @@ def qr(x, mode="reduced"):
 
 def solve(a, b):
     # tensorflow.linalg.solve only supports same rank inputs
-    if tf.rank(b) == tf.rank(a) - 1:
+    if b.shape.ndims == a.shape.ndims - 1:
         b = tf.expand_dims(b, axis=-1)
         return tf.squeeze(tf.linalg.solve(a, b), axis=-1)
     return tf.linalg.solve(a, b)
@@ -185,6 +198,8 @@ def solve_triangular(a, b, lower=False):
 
 
 def svd(x, full_matrices=True, compute_uv=True):
+    if compute_uv is False:
+        return tf.linalg.svd(x, full_matrices=full_matrices, compute_uv=False)
     s, u, v = tf.linalg.svd(
         x, full_matrices=full_matrices, compute_uv=compute_uv
     )
@@ -201,8 +216,7 @@ def lstsq(a, b, rcond=None):
         b = b[:, None]
     if a.ndim != 2:
         raise TypeError(
-            f"{a.ndim}-dimensional array given. "
-            "Array must be two-dimensional"
+            f"{a.ndim}-dimensional array given. Array must be two-dimensional"
         )
     if b.ndim != 2:
         raise TypeError(
@@ -230,3 +244,67 @@ def lstsq(a, b, rcond=None):
     if b_orig_ndim == 1:
         x = tf.reshape(x, [-1])
     return x
+
+
+def matrix_rank(x, tol=None):
+    x = convert_to_tensor(x)
+    return tf.linalg.matrix_rank(x, tol=tol)
+
+
+def matrix_power(a, n):
+    a = convert_to_tensor(a)
+    if n == 0:
+        return tf.eye(
+            num_rows=tf.shape(a)[-1],
+            batch_shape=tf.shape(a)[:-2],
+            dtype=a.dtype,
+        )
+
+    if n < 0:
+        a = inv(a)
+        n = abs(n)
+
+    if n == 1:
+        return a
+
+    result = tf.eye(
+        num_rows=tf.shape(a)[-1],
+        batch_shape=tf.shape(a)[:-2],
+        dtype=a.dtype,
+    )
+    base = a
+    while n > 0:
+        if n % 2 == 1:
+            result = tf.matmul(result, base)
+        base = tf.matmul(base, base)
+        n //= 2
+    return result
+
+
+def pinv(x, rcond=None):
+    x = convert_to_tensor(x)
+    return tf.linalg.pinv(x, rcond=rcond)
+
+
+def jvp(fun, primals, tangents, has_aux=False):
+    primal_flat = tf.nest.flatten(primals)
+    tangent_flat = tf.nest.flatten(tangents)
+
+    tangent_flat = [
+        tf.cast(t, p.dtype) for t, p in zip(tangent_flat, primal_flat)
+    ]
+
+    with tf.autodiff.ForwardAccumulator(primal_flat, tangent_flat) as acc:
+        if has_aux:
+            primals_out, aux = fun(*primals)
+        else:
+            primals_out = fun(*primals)
+
+        primals_out_flat = tf.nest.flatten(primals_out)
+        tangents_out_flat = [acc.jvp(po) for po in primals_out_flat]
+
+    tangents_out = tf.nest.pack_sequence_as(primals_out, tangents_out_flat)
+
+    if has_aux:
+        return primals_out, tangents_out, aux
+    return primals_out, tangents_out

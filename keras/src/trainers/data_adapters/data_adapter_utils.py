@@ -1,6 +1,7 @@
 import numpy as np
 
 from keras.src import backend
+from keras.src import ops
 from keras.src import tree
 from keras.src.api_export import keras_export
 
@@ -100,7 +101,9 @@ def list_to_tuple(maybe_list):
 
 
 def check_data_cardinality(data):
-    num_samples = set(int(i.shape[0]) for i in tree.flatten(data))
+    num_samples = set(
+        int(i.shape[0]) for i in tree.flatten(data) if i is not None
+    )
     if len(num_samples) > 1:
         msg = (
             "Data cardinality is ambiguous. "
@@ -115,30 +118,65 @@ def check_data_cardinality(data):
 
 
 def class_weight_to_sample_weights(y, class_weight):
-    sample_weight = np.ones(shape=(y.shape[0],), dtype=backend.floatx())
-    if len(y.shape) > 1:
-        if y.shape[-1] != 1:
-            y = np.argmax(y, axis=-1)
+    # Validate and normalize class_weight keys to integer class indices.
+    # Without this check, invalid keys are silently ignored, and string keys
+    # (e.g., "0") would fail to match integer lookups later, silently
+    # defaulting sample_weight to 1.0.
+    if not hasattr(class_weight, "items") or not hasattr(class_weight, "get"):
+        raise ValueError(
+            "`class_weight` must be a dict-like mapping of class indices "
+            f"to weights. Received: class_weight={class_weight} of type "
+            f"{type(class_weight)}."
+        )
+
+    cleaned_class_weight = {}
+    for key, val in class_weight.items():
+        try:
+            cleaned_class_weight[int(key)] = val
+        except (TypeError, ValueError):
+            raise ValueError(
+                "`class_weight` must be a dictionary with integer keys "
+                "representing class indices. Received an invalid key: "
+                f"{key!r} of type {type(key)}."
+            )
+    class_weight = cleaned_class_weight
+
+    # Convert to numpy to ensure consistent handling of operations
+    # (e.g., np.round()) across frameworks like TensorFlow, JAX, and PyTorch
+
+    y_numpy = ops.convert_to_numpy(y)
+    sample_weight = np.ones(shape=(y_numpy.shape[0],), dtype=backend.floatx())
+    if len(y_numpy.shape) > 1:
+        if y_numpy.shape[-1] != 1:
+            y_numpy = np.argmax(y_numpy, axis=-1)
         else:
-            y = np.squeeze(y, axis=-1)
-    y = np.round(y).astype("int32")
-    for i in range(y.shape[0]):
-        sample_weight[i] = class_weight.get(int(y[i]), 1.0)
+            y_numpy = np.squeeze(y_numpy, axis=-1)
+    y_numpy = np.round(y_numpy).astype("int32")
+
+    for i in range(y_numpy.shape[0]):
+        sample_weight[i] = class_weight.get(int(y_numpy[i]), 1.0)
     return sample_weight
 
 
-def get_tensor_spec(batches):
-    """Return the common tensor spec for a list of batches.
+def get_keras_tensor_spec(batches):
+    """Return the KerasTensor spec for a list of batches.
+
+    The spec is represented using `KerasTensor` which could handle dense, sparse
+    or ragged tensors.
 
     Args:
         batches: list of structures of tensors. The structures must be
             identical, but the shape at each leaf may be different.
-    Returns: the common tensor spec for all the batches.
+
+    Returns:
+        A nested structure of `KerasTensor`.
     """
-    from keras.src.utils.module_utils import tensorflow as tf
 
     def get_single_tensor_spec(*tensors):
         x = tensors[0]
+        if not hasattr(x, "shape"):
+            # Try to convert to a numpy array.
+            x = np.array(x)
         rank = len(x.shape)
         if rank < 1:
             raise ValueError(
@@ -158,28 +196,94 @@ def get_tensor_spec(batches):
         for dims in zip(*[list(x.shape) for x in tensors]):
             dims_set = set(dims)
             shape.append(dims_set.pop() if len(dims_set) == 1 else None)
-        shape[0] = None  # batch size may not be static
 
         dtype = backend.standardize_dtype(x.dtype)
-        if isinstance(x, tf.RaggedTensor):
-            return tf.RaggedTensorSpec(shape=shape, dtype=dtype)
-        if (
-            isinstance(x, tf.SparseTensor)
-            or is_scipy_sparse(x)
-            or is_jax_sparse(x)
-        ):
-            return tf.SparseTensorSpec(shape=shape, dtype=dtype)
+        if is_tensorflow_ragged(x):
+            return backend.KerasTensor(
+                shape=shape,
+                dtype=dtype,
+                ragged=True,
+                ragged_rank=x.ragged_rank,
+                row_splits_dtype=x.row_splits.dtype,
+            )
+        if is_tensorflow_sparse(x) or is_scipy_sparse(x) or is_jax_sparse(x):
+            return backend.KerasTensor(shape=shape, dtype=dtype, sparse=True)
         else:
-            return tf.TensorSpec(shape=shape, dtype=dtype)
+            return backend.KerasTensor(shape=shape, dtype=dtype)
 
-    return tree.map_structure(get_single_tensor_spec, *batches)
+    return tree.map_structure(
+        get_single_tensor_spec, *batches, none_is_leaf=False
+    )
+
+
+def convert_to_tf_tensor_spec(keras_tensor, batch_axis_to_none=True):
+    """Convert a KerasTensor to a TensorSpec.
+
+    Args:
+        keras_tensor: A KerasTensor instance.
+        batch_axis_to_none: If `True`, the batch axis of the returned
+            tensor spec will be set to None. Defaults to `True`.
+    """
+    from keras.src.utils.module_utils import tensorflow as tf
+
+    if keras_tensor is None:
+        return tf.OptionalSpec(None)
+    if not isinstance(keras_tensor, backend.KerasTensor):
+        raise TypeError(
+            f"Expected a KerasTensor, but got {keras_tensor} of type "
+            f"{type(keras_tensor)}."
+        )
+    shape = list(keras_tensor.shape)
+    if batch_axis_to_none:
+        shape[0] = None
+    if keras_tensor.ragged:
+        return tf.RaggedTensorSpec(
+            shape=shape,
+            dtype=keras_tensor.dtype,
+            ragged_rank=keras_tensor.ragged_rank,
+            row_splits_dtype=keras_tensor.row_splits_dtype,
+        )
+    elif keras_tensor.sparse:
+        return tf.SparseTensorSpec(shape=shape, dtype=keras_tensor.dtype)
+    else:
+        return tf.TensorSpec(shape=shape, dtype=keras_tensor.dtype)
+
+
+def get_tensor_spec(batches):
+    """Return the common tensor spec for a list of batches.
+
+    The spec is represented using `tf.TensorSpec`, `tf.SparseTensorSpec` and
+    `tf.RaggedTensorSpec`.
+
+    Args:
+        batches: list of structures of tensors. The structures must be
+            identical, but the shape at each leaf may be different.
+
+    Returns:
+        A common tensor spec.
+    """
+    tensor_specs = get_keras_tensor_spec(batches)
+    return tree.map_structure(convert_to_tf_tensor_spec, tensor_specs)
 
 
 def get_jax_iterator(iterable):
-    from keras.src.backend.jax.core import convert_to_tensor
+    import jax
+    import jax.experimental.sparse as jax_sparse
+
+    def convert_to_jax_compatible(x):
+        if isinstance(x, (jax.Array, jax_sparse.JAXSparse, np.ndarray)):
+            return x
+        elif is_scipy_sparse(x):
+            return scipy_sparse_to_jax_sparse(x)
+        elif is_tensorflow_sparse(x):
+            return tf_sparse_to_jax_sparse(x)
+        else:
+            return np.asarray(x)
 
     for batch in iterable:
-        yield tree.map_structure(convert_to_tensor, batch)
+        yield tree.map_structure(
+            convert_to_jax_compatible, batch, none_is_leaf=False
+        )
 
 
 def get_numpy_iterator(iterable):
@@ -195,7 +299,7 @@ def get_numpy_iterator(iterable):
         return x
 
     for batch in iterable:
-        yield tree.map_structure(convert_to_numpy, batch)
+        yield tree.map_structure(convert_to_numpy, batch, none_is_leaf=False)
 
 
 def get_torch_dataloader(iterable):
@@ -209,7 +313,9 @@ def get_torch_dataloader(iterable):
 
         def __iter__(self):
             for batch in self.iterable:
-                yield tree.map_structure(convert_to_tensor, batch)
+                yield tree.map_structure(
+                    convert_to_tensor, batch, none_is_leaf=False
+                )
 
     dataset = ConverterIterableDataset(iterable)
     # `batch_size=None` indicates that we should not re-batch
@@ -272,6 +378,109 @@ def is_torch_tensor(value):
     return False
 
 
+def is_pandas_data_frame(value):
+    return (
+        hasattr(value, "__class__")
+        and value.__class__.__name__ == "DataFrame"
+        and str(value.__class__.__module__).startswith("pandas")
+    )
+
+
+def is_pandas_series(value):
+    return (
+        hasattr(value, "__class__")
+        and value.__class__.__name__ == "Series"
+        and str(value.__class__.__module__).startswith("pandas")
+    )
+
+
+class DistributedBatchSampler:
+    """Sampler that shards a batch sampler.
+
+    This sampler is useful for sharding an existing batch sampler (an iterable
+    of batches) across multiple data shards.
+
+    This is intentionally a batch-level sharding helper for cases where the
+    underlying iterator already produces full batches. In `ArrayDataAdapter`, we
+    build batch samplers over the dataset and then may optionally shuffle within
+    each returned batch.
+
+    Args:
+        batch_sampler: An iterable of batches. For example, a
+            `torch.utils.data.BatchSampler` instance.
+        num_data_shards: Total number of data shards.
+        data_shard_id: ID of the current data shard.
+        drop_last: Whether to drop the last partial batch.
+    """
+
+    def __init__(
+        self, batch_sampler, num_data_shards, data_shard_id, drop_last=False
+    ):
+        """Initialize the DistributedBatchSampler.
+
+        Args:
+            batch_sampler: An iterable of batches.
+            num_data_shards: Total number of data shards.
+            data_shard_id: ID of the current data shard.
+            drop_last: Whether to drop the last partial batch.
+        """
+        if num_data_shards < 1:
+            raise ValueError(
+                f"num_data_shards must be >= 1. Received: {num_data_shards}"
+            )
+        if not (0 <= data_shard_id < num_data_shards):
+            raise ValueError(
+                f"data_shard_id must be in [0, {num_data_shards - 1}]. "
+                f"Received: {data_shard_id}"
+            )
+        self.batch_sampler = batch_sampler
+        self.num_data_shards = num_data_shards
+        self.data_shard_id = data_shard_id
+        self.drop_last = drop_last
+
+    def __iter__(self):
+        sampler_len = len(self.batch_sampler)
+
+        limit = (
+            (sampler_len // self.num_data_shards) * self.num_data_shards
+            if self.drop_last
+            else sampler_len
+        )
+
+        import torch
+
+        # Optimization: if the batch_sampler is a standard BatchSampler
+        # with an indexable sampler, we can skip indices efficiently.
+        if isinstance(self.batch_sampler, torch.utils.data.BatchSampler):
+            sampler = self.batch_sampler.sampler
+            if hasattr(sampler, "__getitem__") and not isinstance(
+                sampler, torch.utils.data.Sampler
+            ):
+                for i in range(self.data_shard_id, limit, self.num_data_shards):
+                    # Manual index-based access is more efficient than filtering
+                    # the iterator.
+                    yield sampler[
+                        i * self.batch_sampler.batch_size : (i + 1)
+                        * self.batch_sampler.batch_size
+                    ]
+                return
+
+        for i, batch in enumerate(self.batch_sampler):
+            if i >= limit:
+                break
+            if i % self.num_data_shards == self.data_shard_id:
+                yield batch
+
+    def __len__(self):
+        sampler_len = len(self.batch_sampler)
+
+        if self.drop_last:
+            return sampler_len // self.num_data_shards
+        return (
+            sampler_len - self.data_shard_id + self.num_data_shards - 1
+        ) // self.num_data_shards
+
+
 def is_scipy_sparse(x):
     return str(x.__class__.__module__).startswith("scipy.sparse") and hasattr(
         x, "tocoo"
@@ -289,17 +498,21 @@ def scipy_sparse_to_tf_sparse(x):
 
 
 def scipy_sparse_to_jax_sparse(x):
+    import jax
     import jax.experimental.sparse as jax_sparse
 
-    return jax_sparse.BCOO.from_scipy_sparse(x)
+    with jax.default_device(jax.local_devices(backend="cpu")[0]):
+        return jax_sparse.BCOO.from_scipy_sparse(x)
 
 
 def tf_sparse_to_jax_sparse(x):
+    import jax
     import jax.experimental.sparse as jax_sparse
 
     values = np.asarray(x.values)
     indices = np.asarray(x.indices)
-    return jax_sparse.BCOO((values, indices), shape=x.shape)
+    with jax.default_device(jax.local_devices(backend="cpu")[0]):
+        return jax_sparse.BCOO((values, indices), shape=x.shape)
 
 
 def jax_sparse_to_tf_sparse(x):

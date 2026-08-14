@@ -25,7 +25,6 @@ class UpSampling1D(Layer):
       [ 0.  1.  2.]
       [ 3.  4.  5.]
       [ 3.  4.  5.]]
-
      [[ 6.  7.  8.]
       [ 6.  7.  8.]
       [ 9. 10. 11.]
@@ -43,7 +42,16 @@ class UpSampling1D(Layer):
 
     def __init__(self, size=2, **kwargs):
         super().__init__(**kwargs)
-        self.size = int(size)
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError(
+                f"Expected an integer value for `size`, got {type(size)}."
+            )
+        if size <= 0:
+            raise ValueError(
+                "Argument `size` should be a positive integer. "
+                f"Received: size={size}"
+            )
+        self.size = size
         self.input_spec = InputSpec(ndim=3)
 
     def compute_output_shape(self, input_shape):

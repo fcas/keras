@@ -8,6 +8,8 @@ import pytest
 import keras
 from keras.src import ops
 from keras.src import testing
+from keras.src.saving import deserialize_keras_object
+from keras.src.saving import object_registration
 from keras.src.saving import serialization_lib
 
 
@@ -174,31 +176,55 @@ class SerializationLibTest(testing.TestCase):
         _, new_obj, _ = self.roundtrip(obj, safe_mode=False)
         self.assertEqual(obj["activation"](3), new_obj["activation"](3))
 
-    # TODO
-    # def test_lambda_layer(self):
-    #     lmbda = keras.layers.Lambda(lambda x: x**2)
-    #     with self.assertRaisesRegex(ValueError, "arbitrary code execution"):
-    #         self.roundtrip(lmbda, safe_mode=True)
+    def test_lambda_layer(self):
+        lmbda = keras.layers.Lambda(lambda x: x**2)
+        with self.assertRaisesRegex(ValueError, "arbitrary code execution"):
+            self.roundtrip(lmbda, safe_mode=True)
 
-    #     _, new_lmbda, _ = self.roundtrip(lmbda, safe_mode=False)
-    #     x = ops.random.normal((2, 2))
-    #     y1 = lmbda(x)
-    #     y2 = new_lmbda(x)
-    #     self.assertAllClose(y1, y2, atol=1e-5)
+        _, new_lmbda, _ = self.roundtrip(lmbda, safe_mode=False)
+        x = ops.random.normal((2, 2))
+        y1 = lmbda(x)
+        y2 = new_lmbda(x)
+        self.assertAllClose(y1, y2, atol=1e-5)
 
-    # def test_safe_mode_scope(self):
-    #     lmbda = keras.layers.Lambda(lambda x: x**2)
-    #     with serialization_lib.SafeModeScope(safe_mode=True):
-    #         with self.assertRaisesRegex(
-    #             ValueError, "arbitrary code execution"
-    #         ):
-    #             self.roundtrip(lmbda)
-    #     with serialization_lib.SafeModeScope(safe_mode=False):
-    #         _, new_lmbda, _ = self.roundtrip(lmbda)
-    #     x = ops.random.normal((2, 2))
-    #     y1 = lmbda(x)
-    #     y2 = new_lmbda(x)
-    #     self.assertAllClose(y1, y2, atol=1e-5)
+    def test_deserialize_invalid_type_config(self):
+        bad_config = {"class_name": "Dense", "config": [1, 2, 3]}
+        with self.assertRaisesRegex(
+            TypeError, "Expected 'config' to be a dict"
+        ):
+            serialization_lib.deserialize_keras_object(bad_config)
+
+    def test_deserialize_invalid_typespec_config(self):
+        bad_config = {
+            "class_name": "__typespec__",
+            "config": "not_a_list_nor_a_tuple",
+        }
+        with self.assertRaisesRegex(
+            TypeError, "Expected 'config' to be a list or a tuple"
+        ):
+            serialization_lib.deserialize_keras_object(bad_config)
+
+    def test_deserialize_invalid_function_config(self):
+        bad_config = {
+            "class_name": "function",
+            "config": ["not", "a", "string"],
+        }
+        with self.assertRaisesRegex(
+            TypeError, "Expected 'config' to be a non-null str"
+        ):
+            serialization_lib.deserialize_keras_object(bad_config)
+
+    def test_safe_mode_scope(self):
+        lmbda = keras.layers.Lambda(lambda x: x**2)
+        with serialization_lib.SafeModeScope(safe_mode=True):
+            with self.assertRaisesRegex(ValueError, "arbitrary code execution"):
+                self.roundtrip(lmbda)
+        with serialization_lib.SafeModeScope(safe_mode=False):
+            _, new_lmbda, _ = self.roundtrip(lmbda)
+        x = ops.random.normal((2, 2))
+        y1 = lmbda(x)
+        y2 = new_lmbda(x)
+        self.assertAllClose(y1, y2, atol=1e-5)
 
     @pytest.mark.requires_trainable_backend
     def test_dict_inputs_outputs(self):
@@ -343,6 +369,215 @@ class SerializationLibTest(testing.TestCase):
         serialized, deserialized, reserialized = self.roundtrip(func)
         self.assertLen(deserialized.layers, 3)
 
+    def test_keras36_custom_function_reloading(self):
+        @object_registration.register_keras_serializable(package="serial_test")
+        def custom_registered_fn(x):
+            return x**2
+
+        config36 = {
+            "module": "builtins",
+            "class_name": "function",
+            "config": "custom_registered_fn",
+            "registered_name": "function",
+        }
+        obj = serialization_lib.deserialize_keras_object(config36)
+        self.assertIs(obj, custom_registered_fn)
+
+        config = {
+            "module": "builtins",
+            "class_name": "function",
+            "config": "serial_test>custom_registered_fn",
+            "registered_name": "function",
+        }
+        obj = serialization_lib.deserialize_keras_object(config)
+        self.assertIs(obj, custom_registered_fn)
+
+    def test_layer_instance_as_activation(self):
+        """Tests serialization when activation is a Layer instance."""
+
+        # Dense layer with ReLU layer as activation
+        layer_dense_relu = keras.layers.Dense(
+            units=4, activation=keras.layers.ReLU(name="my_relu")
+        )
+        # Build the layer to ensure weights/state are initialized if needed
+        layer_dense_relu.build(input_shape=(None, 8))
+        _, restored_dense_relu, _ = self.roundtrip(layer_dense_relu)
+
+        # Verify the activation is correctly deserialized as a ReLU layer
+        self.assertIsInstance(restored_dense_relu.activation, keras.layers.ReLU)
+        # Verify properties are preserved
+        self.assertEqual(restored_dense_relu.activation.name, "my_relu")
+
+    def test_layer_instance_with_config_as_activation(self):
+        """
+        Tests serialization when activation is a Layer instance with config.
+        """
+
+        # Conv1D layer with LeakyReLU layer (with config) as activation
+        leaky_activation = keras.layers.LeakyReLU(
+            negative_slope=0.15, name="my_leaky"
+        )
+        layer_conv_leaky = keras.layers.Conv1D(
+            filters=2, kernel_size=3, activation=leaky_activation
+        )
+        # Build the layer
+        layer_conv_leaky.build(input_shape=(None, 10, 4))
+        _, restored_conv_leaky, _ = self.roundtrip(layer_conv_leaky)
+
+        # Verify the activation is correctly deserialized as LeakyReLU
+        self.assertIsInstance(
+            restored_conv_leaky.activation, keras.layers.LeakyReLU
+        )
+        # Verify configuration of the activation layer is preserved
+        self.assertEqual(restored_conv_leaky.activation.negative_slope, 0.15)
+        self.assertEqual(restored_conv_leaky.activation.name, "my_leaky")
+
+    def test_layer_string_as_activation(self):
+        """Tests serialization when activation is a string."""
+
+        layer_dense_relu_string = keras.layers.Dense(units=4, activation="relu")
+        layer_dense_relu_string.build(input_shape=(None, 8))
+        _, restored_dense_relu_string, _ = self.roundtrip(
+            layer_dense_relu_string
+        )
+
+        # Verify the activation is correctly deserialized to the relu function
+        self.assertTrue(callable(restored_dense_relu_string.activation))
+        # Check if it resolves to the canonical keras activation function
+        self.assertEqual(
+            restored_dense_relu_string.activation, keras.activations.relu
+        )
+
+    def test_missing_name_for_sequential_model(self):
+        """Tests serialization when sequential model has no name."""
+        serialized = {
+            "class_name": "Sequential",
+            "module": "keras",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "module": "keras.layers",
+                        "config": {"units": 4},
+                    }
+                ],
+            },
+        }
+        with self.assertRaisesRegex(
+            ValueError,
+            "A Sequential model configuration must be a "
+            "dictionary containing the 'name' and 'layers' keys",
+        ):
+            deserialize_keras_object(serialized)
+
+    def test_malformed_layer_for_sequential_model(self):
+        serialized = {
+            "class_name": "Sequential",
+            "module": "keras",
+            "config": {
+                "name": "sequential_model",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "module": "keras.layers",
+                        "config": {"units": 4},
+                    },
+                    {},
+                ],
+            },
+        }
+        with self.assertRaisesRegex(
+            ValueError, "Expected a dictionary containing a 'config' key."
+        ):
+            deserialize_keras_object(serialized)
+
+    def test_registered_name_for_keras_builtin_raises(self):
+        for bad_name in (
+            "builtins.eval",
+            "subprocess.Popen",
+            "not.a.real.name",
+            "my_pkg>MyDense",
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "resolved to a Keras built-in"
+            ):
+                serialization_lib.deserialize_keras_object(
+                    {
+                        "class_name": "Dense",
+                        "module": "keras.layers",
+                        "registered_name": bad_name,
+                        "config": {"units": 1},
+                    }
+                )
+
+    def test_registered_name_matching_class_name_passes_through(self):
+        obj = serialization_lib.deserialize_keras_object(
+            {
+                "class_name": "Dense",
+                "module": "keras.layers",
+                "registered_name": "Dense",
+                "config": {"units": 1},
+            }
+        )
+        self.assertIsInstance(obj, keras.layers.Dense)
+
+    def test_none_or_missing_registered_name_passes_through(self):
+        for config in (
+            {
+                "class_name": "Dense",
+                "module": "keras.layers",
+                "registered_name": None,
+                "config": {"units": 1},
+            },
+            {
+                "class_name": "Dense",
+                "module": "keras.layers",
+                "config": {"units": 1},
+            },
+        ):
+            obj = serialization_lib.deserialize_keras_object(config)
+            self.assertIsInstance(obj, keras.layers.Dense)
+
+    def test_empty_string_registered_name_passes_through(self):
+        obj = serialization_lib.deserialize_keras_object(
+            {
+                "class_name": "Dense",
+                "module": "keras.layers",
+                "registered_name": "",
+                "config": {"units": 1},
+            }
+        )
+        self.assertIsInstance(obj, keras.layers.Dense)
+
+    def test_registered_name_for_keras_builtin_function_raises(self):
+        with self.assertRaisesRegex(ValueError, "resolved to a Keras built-in"):
+            serialization_lib.deserialize_keras_object(
+                {
+                    "class_name": "function",
+                    "module": "builtins",
+                    "registered_name": "some_other_name",
+                    "config": "relu",
+                }
+            )
+
+    def test_registered_name_matching_function_name_passes_through(self):
+        for registered_name in ("function", "kl_divergence"):
+            obj = serialization_lib.deserialize_keras_object(
+                {
+                    "class_name": "function",
+                    "module": "builtins",
+                    "registered_name": registered_name,
+                    "config": "kl_divergence",
+                }
+            )
+            self.assertIs(obj, keras.metrics.kl_divergence)
+
+    def test_registered_custom_object_still_resolves(self):
+        layer = MyDense(units=4)
+        config = serialization_lib.serialize_keras_object(layer)
+        restored = serialization_lib.deserialize_keras_object(config)
+        self.assertIsInstance(restored, MyDense)
+
 
 @keras.saving.register_keras_serializable()
 class MyDense(keras.layers.Layer):
@@ -352,7 +587,7 @@ class MyDense(keras.layers.Layer):
         *,
         kernel_regularizer=None,
         kernel_initializer=None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self._units = units
@@ -364,7 +599,7 @@ class MyDense(keras.layers.Layer):
             units=self._units,
             kernel_initializer=self._kernel_initializer,
             kernel_regularizer=self._kernel_regularizer,
-            **super().get_config()
+            **super().get_config(),
         )
 
     def build(self, input_shape):

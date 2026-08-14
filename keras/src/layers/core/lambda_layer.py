@@ -167,27 +167,37 @@ class Lambda(Layer):
         )
 
     @staticmethod
-    def _raise_for_lambda_deserialization(arg_name, safe_mode):
+    def _raise_for_lambda_deserialization(safe_mode):
         if safe_mode:
             raise ValueError(
-                "The `{arg_name}` of this `Lambda` layer is a Python lambda. "
-                "Deserializing it is unsafe. If you trust the source of the "
-                "config artifact, you can override this error "
-                "by passing `safe_mode=False` "
-                "to `from_config()`, or calling "
+                "Requested the deserialization of a `Lambda` layer whose "
+                "`function` is a Python lambda. This carries a potential risk "
+                "of arbitrary code execution and thus it is disallowed by "
+                "default. If you trust the source of the artifact, you can "
+                "override this error by passing `safe_mode=False` to the "
+                "loading function, or calling "
                 "`keras.config.enable_unsafe_deserialization()."
             )
 
     @classmethod
     def from_config(cls, config, custom_objects=None, safe_mode=None):
-        safe_mode = safe_mode or serialization_lib.in_safe_mode()
+        # When `safe_mode` is unset, fall back to the ambient deserialization
+        # scope, treating an unset scope as safe. This fails closed so that
+        # deserializing a `Lambda` outside of a `SafeModeScope` (e.g. a direct
+        # `from_config` call) does not silently allow arbitrary code execution.
+        effective_safe_mode = (
+            safe_mode
+            if safe_mode is not None
+            else serialization_lib.in_safe_mode()
+        )
+        safe_mode = effective_safe_mode is not False
         fn_config = config["function"]
         if (
             isinstance(fn_config, dict)
             and "class_name" in fn_config
             and fn_config["class_name"] == "__lambda__"
         ):
-            cls._raise_for_lambda_deserialization("function", safe_mode)
+            cls._raise_for_lambda_deserialization(safe_mode)
             inner_config = fn_config["config"]
             fn = python_utils.func_load(
                 inner_config["code"],
@@ -206,7 +216,7 @@ class Lambda(Layer):
                 and "class_name" in fn_config
                 and fn_config["class_name"] == "__lambda__"
             ):
-                cls._raise_for_lambda_deserialization("function", safe_mode)
+                cls._raise_for_lambda_deserialization(safe_mode)
                 inner_config = fn_config["config"]
                 fn = python_utils.func_load(
                     inner_config["code"],
@@ -215,11 +225,15 @@ class Lambda(Layer):
                 )
                 config["output_shape"] = fn
             else:
-                config["output_shape"] = (
-                    serialization_lib.deserialize_keras_object(
-                        fn_config, custom_objects=custom_objects
-                    )
+                output_shape = serialization_lib.deserialize_keras_object(
+                    fn_config, custom_objects=custom_objects
                 )
+                if isinstance(output_shape, list) and all(
+                    isinstance(e, (int, type(None))) for e in output_shape
+                ):
+                    output_shape = tuple(output_shape)
+                config["output_shape"] = output_shape
+
         if "arguments" in config:
             config["arguments"] = serialization_lib.deserialize_keras_object(
                 config["arguments"], custom_objects=custom_objects

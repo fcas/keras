@@ -8,16 +8,15 @@ from keras.src.api_export import keras_export
 from keras.src.utils import io_utils
 
 try:
-    # pydot-ng is a fork of pydot that is better maintained.
-    import pydot_ng as pydot
+    import pydot
 except ImportError:
-    # pydotplus is an improved version of pydot
+    # pydot_ng and pydotplus are older forks of pydot
+    # which may still be used by some users
     try:
-        import pydotplus as pydot
+        import pydot_ng as pydot
     except ImportError:
-        # Fall back on pydot if necessary.
         try:
-            import pydot
+            import pydotplus as pydot
         except ImportError:
             pydot = None
 
@@ -36,13 +35,15 @@ def check_graphviz():
         # to check the pydot/graphviz installation.
         pydot.Dot.create(pydot.Dot())
         return True
-    except (OSError, pydot.InvocationException):
+    except (OSError, pydot.PydotException):
         return False
 
 
 def add_edge(dot, src, dst):
-    if not dot.get_edge(src, dst):
-        edge = pydot.Edge(src, dst)
+    src_id = str(id(src))
+    dst_id = str(id(dst))
+    if not dot.get_edge(src_id, dst_id):
+        edge = pydot.Edge(src_id, dst_id)
         edge.set("penwidth", "2")
         dot.add_edge(edge)
 
@@ -150,7 +151,7 @@ def make_layer_label(layer, **kwargs):
         cols.append(
             (
                 '<td bgcolor="white"><font point-size="14">'
-                f'Output dtype: <b>{dtype or "?"}</b>'
+                f"Output dtype: <b>{dtype or '?'}</b>"
                 "</font></td>"
             )
         )
@@ -177,7 +178,7 @@ def make_layer_label(layer, **kwargs):
         colspan = 1
 
     if cols:
-        table += "<tr>" + "".join(cols) + "</tr>"
+        table += f"<tr>{''.join(cols)}</tr>"
     table += "</table>>"
     return table
 
@@ -202,6 +203,7 @@ def model_to_dot(
     subgraph=False,
     show_layer_activations=False,
     show_trainable=False,
+    splines="ortho",
     **kwargs,
 ):
     """Convert a Keras model to dot format.
@@ -221,6 +223,9 @@ def model_to_dot(
         show_layer_activations: Display layer activations (only for layers that
             have an `activation` property).
         show_trainable: whether to display if a layer is trainable.
+        splines: Controls how edges are drawn. Defaults to `"ortho"`
+            (right-angle lines). Other options include `"curved"`,
+            `"polyline"`, `"spline"`, and `"line"`.
 
     Returns:
         A `pydot.Dot` instance representing the Keras model or
@@ -256,7 +261,7 @@ def model_to_dot(
         dot.set("rankdir", rankdir)
         dot.set("concentrate", True)
         dot.set("dpi", dpi)
-        dot.set("splines", "ortho")
+        dot.set("splines", splines)
         dot.set_node_defaults(shape="record")
 
     if kwargs.pop("layer_range", None) is not None:
@@ -283,11 +288,11 @@ def model_to_dot(
         layers = model._operations
 
     # Create graph nodes.
-    sub_n_first_node = {}
-    sub_n_last_node = {}
     for i, layer in enumerate(layers):
-        # Process nested functional models.
-        if expand_nested and isinstance(layer, functional.Functional):
+        # Process nested functional and sequential models.
+        if expand_nested and isinstance(
+            layer, (functional.Functional, sequential.Sequential)
+        ):
             submodel = model_to_dot(
                 layer,
                 show_shapes,
@@ -299,10 +304,6 @@ def model_to_dot(
                 show_layer_activations=show_layer_activations,
                 show_trainable=show_trainable,
             )
-            # sub_n : submodel
-            sub_n_nodes = submodel.get_nodes()
-            sub_n_first_node[layer.name] = sub_n_nodes[0]
-            sub_n_last_node[layer.name] = sub_n_nodes[-1]
             dot.add_subgraph(submodel)
 
         else:
@@ -310,54 +311,98 @@ def model_to_dot(
             dot.add_node(node)
 
     # Connect nodes with edges.
-    # Sequential case.
     if isinstance(model, sequential.Sequential):
-        for i in range(len(layers) - 1):
-            inbound_layer_id = str(id(layers[i]))
-            layer_id = str(id(layers[i + 1]))
-            add_edge(dot, inbound_layer_id, layer_id)
-        return dot
+        if not expand_nested:
+            # Single Sequential case.
+            for i in range(len(layers) - 1):
+                add_edge(dot, layers[i], layers[i + 1])
+            return dot
+        else:
+            # The first layer is connected to the `InputLayer`, which is not
+            # represented for Sequential models, so we skip it. What will draw
+            # the incoming edge from outside of the sequential model is the
+            # edge connecting the Sequential model itself.
+            layers = model.layers[1:]
 
-    # Functional case.
-    for i, layer in enumerate(layers):
-        layer_id = str(id(layer))
-        for i, node in enumerate(layer._inbound_nodes):
-            node_key = make_node_key(layer, i)
-            if node_key in model._nodes:
-                for parent_node in node.parent_nodes:
-                    inbound_layer = parent_node.operation
-                    inbound_layer_id = str(id(inbound_layer))
-                    if not expand_nested:
-                        assert dot.get_node(inbound_layer_id)
-                        assert dot.get_node(layer_id)
-                        add_edge(dot, inbound_layer_id, layer_id)
+    # Functional and nested Sequential case.
+    for layer in layers:
+        # Go from current layer to input `Node`s.
+        for inbound_index, inbound_node in enumerate(layer._inbound_nodes):
+            # `inbound_node` is a `Node`.
+            if (
+                isinstance(model, functional.Functional)
+                and make_node_key(layer, inbound_index) not in model._nodes
+            ):
+                continue
+
+            # Go from input `Node` to `KerasTensor` representing that input.
+            for input_index, input_tensor in enumerate(
+                inbound_node.input_tensors
+            ):
+                # `input_tensor` is a `KerasTensor`.
+                # `input_history` is a `KerasHistory`.
+                input_history = input_tensor._keras_history
+                if input_history.operation is None:
+                    # Operation is `None` for `Input` tensors.
+                    continue
+
+                # Go from input `KerasTensor` to the `Operation` that produced
+                # it as an output.
+                input_node = input_history.operation._inbound_nodes[
+                    input_history.node_index
+                ]
+                output_index = input_history.tensor_index
+
+                # Tentative source and destination of the edge.
+                source = input_node.operation
+                destination = layer
+
+                if not expand_nested:
+                    # No nesting, connect directly.
+                    add_edge(dot, source, layer)
+                    continue
+
+                # ==== Potentially nested models case ====
+
+                # ---- Resolve the source of the edge ----
+                while isinstance(
+                    source,
+                    (functional.Functional, sequential.Sequential),
+                ):
+                    # When `source` is a `Functional` or `Sequential` model, we
+                    # need to connect to the correct box within that model.
+                    # Functional and sequential models do not have explicit
+                    # "output" boxes, so we need to find the correct layer that
+                    # produces the output we're connecting to, which can be
+                    # nested several levels deep in sub-models. Hence the while
+                    # loop to continue going into nested models until we
+                    # encounter a real layer that's not a `Functional` or
+                    # `Sequential`.
+                    source, _, output_index = source.outputs[
+                        output_index
+                    ]._keras_history
+
+                # ---- Resolve the destination of the edge ----
+                while isinstance(
+                    destination,
+                    (functional.Functional, sequential.Sequential),
+                ):
+                    if isinstance(destination, functional.Functional):
+                        # When `destination` is a `Functional`, we point to the
+                        # specific `InputLayer` in the model.
+                        destination = destination.inputs[
+                            input_index
+                        ]._keras_history.operation
                     else:
-                        # if inbound_layer is not Functional
-                        if not isinstance(inbound_layer, functional.Functional):
-                            # if current layer is not Functional
-                            if not isinstance(layer, functional.Functional):
-                                assert dot.get_node(inbound_layer_id)
-                                assert dot.get_node(layer_id)
-                                add_edge(dot, inbound_layer_id, layer_id)
-                            # if current layer is Functional
-                            elif isinstance(layer, functional.Functional):
-                                add_edge(
-                                    dot,
-                                    inbound_layer_id,
-                                    sub_n_first_node[layer.name].get_name(),
-                                )
-                        # if inbound_layer is Functional
-                        elif isinstance(inbound_layer, functional.Functional):
-                            name = sub_n_last_node[
-                                inbound_layer.name
-                            ].get_name()
-                            if isinstance(layer, functional.Functional):
-                                output_name = sub_n_first_node[
-                                    layer.name
-                                ].get_name()
-                                add_edge(dot, name, output_name)
-                            else:
-                                add_edge(dot, name, layer_id)
+                        # When `destination` is a `Sequential`, there is no
+                        # explicit "input" box, so we want to point to the first
+                        # box in the model, but it may itself be another model.
+                        # Hence the while loop to continue going into nested
+                        # models until we encounter a real layer that's not a
+                        # `Functional` or `Sequential`.
+                        destination = destination.layers[0]
+
+                add_edge(dot, source, destination)
     return dot
 
 
@@ -373,6 +418,7 @@ def plot_model(
     dpi=200,
     show_layer_activations=False,
     show_trainable=False,
+    splines="ortho",
     **kwargs,
 ):
     """Converts a Keras model to dot format and save to a file.
@@ -403,6 +449,9 @@ def plot_model(
         show_layer_activations: Display layer activations (only for layers that
             have an `activation` property).
         show_trainable: whether to display if a layer is trainable.
+        splines: Controls how edges are drawn. Defaults to `"ortho"`
+            (right-angle lines). Other options include `"curved"`,
+            `"polyline"`, `"spline"`, and `"line"`.
 
     Returns:
         A Jupyter notebook Image object if Jupyter is installed.
@@ -456,6 +505,7 @@ def plot_model(
         dpi=dpi,
         show_layer_activations=show_layer_activations,
         show_trainable=show_trainable,
+        splines=splines,
     )
     to_file = str(to_file)
     if dot is None:

@@ -1,16 +1,26 @@
 # Tensorflow.
-tensorflow-cpu~=2.16.1;sys_platform != 'darwin'  # Pin to TF 2.16
-tensorflow~=2.16.1;sys_platform == 'darwin'
+# Note: when the version of Tensorflow is changed, the version tf_keras must be
+# changed in .github/workflows/actions.yml (pip install --no-deps tf_keras).
+tensorflow-cpu;sys_platform != 'darwin'
+tensorflow;sys_platform == 'darwin'
+ai-edge-litert
 
 # Torch.
-# TODO: Pin to < 2.3.0 (GitHub issue #19602)
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.1.0, <2.3.0
-torchvision>=0.16.0
+torch
+torch-xla;sys_platform != 'darwin'
 
 # Jax.
+# Pinned to 0.8.0 on CPU for CI compatibility with older backends.
+# Note that we test against the latest JAX on GPU.
 jax[cpu]
 flax
 
+# OpenVino
+openvino
+
 # Common deps.
 -r requirements-common.txt
+
+# LiteRT torch converter.
+litert-torch>=0.9.1

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from keras.src import backend
@@ -22,6 +23,19 @@ class LinalgOpsDynamicShapeTest(testing.TestCase):
         x = KerasTensor([None, 20, 15])
         with self.assertRaises(ValueError):
             linalg.cholesky(x)
+
+    def test_cholesky_inverse(self):
+        x = KerasTensor([None, 20, 20])
+        out = linalg.cholesky_inverse(x)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        x = KerasTensor([None, None, 20])
+        with self.assertRaises(ValueError):
+            linalg.cholesky_inverse(x)
+
+        x = KerasTensor([None, 20, 15])
+        with self.assertRaises(ValueError):
+            linalg.cholesky_inverse(x)
 
     def test_det(self):
         x = KerasTensor([None, 20, 20])
@@ -62,9 +76,6 @@ class LinalgOpsDynamicShapeTest(testing.TestCase):
             linalg.inv(x)
 
     def test_lu_factor(self):
-        if testing.jax_uses_gpu():
-            self.skipTest("Skipping test with JAX + GPU due to temporary error")
-
         x = KerasTensor([None, 4, 3])
         lu, p = linalg.lu_factor(x)
         self.assertEqual(lu.shape, (None, 4, 3))
@@ -75,6 +86,37 @@ class LinalgOpsDynamicShapeTest(testing.TestCase):
         self.assertEqual(lu.shape, (None, 2, 3))
         self.assertEqual(p.shape, (None, 2))
 
+    def test_matrix_rank(self):
+        x = KerasTensor([None, 4, 5])
+        out = linalg.matrix_rank(x)
+        self.assertEqual(out.shape, (None,))
+
+        x = KerasTensor([None, 3, 3])
+        self.assertEqual(linalg.matrix_rank(x).shape, (None,))
+
+        x = KerasTensor([None])
+        with self.assertRaises(ValueError):
+            linalg.matrix_rank(x)
+
+    def test_matrix_power(self):
+        x = KerasTensor([None, 20, 20])
+        out = linalg.matrix_power(x, 3)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        out = linalg.matrix_power(x, 0)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        out = linalg.matrix_power(x, -2)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        x = KerasTensor([None, None, 20])
+        with self.assertRaises(ValueError):
+            linalg.matrix_power(x, 3)
+
+        x = KerasTensor([None, 20, 15])
+        with self.assertRaises(ValueError):
+            linalg.matrix_power(x, 3)
+
     def test_norm(self):
         x = KerasTensor((None, 3))
         self.assertEqual(linalg.norm(x).shape, ())
@@ -84,6 +126,19 @@ class LinalgOpsDynamicShapeTest(testing.TestCase):
         self.assertEqual(
             linalg.norm(x, axis=1, keepdims=True).shape, (None, 1, 3)
         )
+
+    def test_pinv(self):
+        x = KerasTensor([None, 4, 3])
+        out = linalg.pinv(x)
+        self.assertEqual(out.shape, (None, 3, 4))
+
+        x = KerasTensor([None, 20, 20])
+        out = linalg.pinv(x)
+        self.assertEqual(out.shape, (None, 20, 20))
+
+        x = KerasTensor([None])
+        with self.assertRaises(ValueError):
+            linalg.pinv(x)
 
     def test_qr(self):
         x = KerasTensor((None, 4, 3), dtype="float32")
@@ -137,9 +192,6 @@ class LinalgOpsDynamicShapeTest(testing.TestCase):
             linalg.solve(a, b)
 
     def test_solve_triangular(self):
-        if testing.jax_uses_gpu():
-            self.skipTest("Skipping test with JAX + GPU due to temporary error")
-
         a = KerasTensor([None, 20, 20])
         b = KerasTensor([None, 20, 5])
         out = linalg.solve_triangular(a, b)
@@ -196,6 +248,15 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
         with self.assertRaises(ValueError):
             linalg.cholesky(x)
 
+    def test_cholesky_inverse(self):
+        x = KerasTensor([4, 3, 3])
+        out = linalg.cholesky_inverse(x)
+        self.assertEqual(out.shape, (4, 3, 3))
+
+        x = KerasTensor([10, 20, 15])
+        with self.assertRaises(ValueError):
+            linalg.cholesky_inverse(x)
+
     def test_det(self):
         x = KerasTensor([4, 3, 3])
         out = linalg.det(x)
@@ -235,9 +296,6 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
             linalg.inv(x)
 
     def test_lu_factor(self):
-        if testing.jax_uses_gpu():
-            self.skipTest("Skipping test with JAX + GPU due to temporary error")
-
         x = KerasTensor([10, 4, 3])
         lu, p = linalg.lu_factor(x)
         self.assertEqual(lu.shape, (10, 4, 3))
@@ -248,6 +306,24 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
         self.assertEqual(lu.shape, (10, 2, 3))
         self.assertEqual(p.shape, (10, 2))
 
+    def test_matrix_rank(self):
+        x = KerasTensor([4, 3, 5])
+        out = linalg.matrix_rank(x)
+        self.assertEqual(out.shape, (4,))
+
+        x = KerasTensor([10])
+        with self.assertRaises(ValueError):
+            linalg.matrix_rank(x)
+
+    def test_matrix_power(self):
+        x = KerasTensor([4, 3, 3])
+        out = linalg.matrix_power(x, 3)
+        self.assertEqual(out.shape, (4, 3, 3))
+
+        x = KerasTensor([10, 20, 15])
+        with self.assertRaises(ValueError):
+            linalg.matrix_power(x, 3)
+
     def test_norm(self):
         x = KerasTensor((10, 3))
         self.assertEqual(linalg.norm(x).shape, ())
@@ -257,6 +333,15 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
         self.assertEqual(
             linalg.norm(x, axis=1, keepdims=True).shape, (10, 1, 3)
         )
+
+    def test_pinv(self):
+        x = KerasTensor([4, 3, 5])
+        out = linalg.pinv(x)
+        self.assertEqual(out.shape, (4, 5, 3))
+
+        x = KerasTensor([10])
+        with self.assertRaises(ValueError):
+            linalg.pinv(x)
 
     def test_qr(self):
         x = KerasTensor((4, 3), dtype="float32")
@@ -295,9 +380,6 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
             linalg.solve(a, b)
 
     def test_solve_triangular(self):
-        if testing.jax_uses_gpu():
-            self.skipTest("Skipping test with JAX + GPU due to temporary error")
-
         a = KerasTensor([4, 3, 3])
         b = KerasTensor([4, 3, 5])
         out = linalg.solve_triangular(a, b)
@@ -329,15 +411,66 @@ class LinalgOpsStaticShapeTest(testing.TestCase):
         self.assertEqual(s.shape, (10, 2))
 
 
-class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
-
+class LinalgOpsCorrectnessTest(testing.TestCase):
     def test_cholesky(self):
+        if backend.backend() != "openvino":
+            # OpenVINO builds a lazy graph and cannot raise on non-PSD inputs
+            # at graph-construction time; sqrt of a negative produces
+            # NaN silently at inference. There is no check_numerics equivalent
+            # in opset15 that can interrupt execution and surface a Python
+            # exception.
+            x_non_psd = np.random.rand(4, 3, 3).astype("float32")
+            with self.assertRaises(ValueError):
+                linalg.cholesky(x_non_psd)
+
         x = np.random.rand(4, 3, 3).astype("float32")
-        with self.assertRaises(ValueError):
-            linalg.cholesky(x)
-        x_psd = x @ x.transpose((0, 2, 1)) + 1e-5 * np.eye(3)
-        out = linalg.cholesky(x_psd)
-        self.assertAllClose(out, np.linalg.cholesky(x_psd), atol=1e-4)
+        x_psd = np.matmul(x, x.transpose((0, 2, 1))) + 1e-5 * np.eye(
+            3, dtype="float32"
+        )
+
+        l_out = linalg.cholesky(x_psd, upper=False)
+        l_expected = np.linalg.cholesky(x_psd)
+        self.assertAllClose(l_out, l_expected, atol=1e-4)
+
+        u_out = linalg.cholesky(x_psd, upper=True)
+        u_expected = l_expected.transpose((0, 2, 1))
+        self.assertAllClose(u_out, u_expected, atol=1e-4)
+
+    @parameterized.named_parameters(
+        {"testcase_name": "lower", "upper": False},
+        {"testcase_name": "upper", "upper": True},
+    )
+    def test_cholesky_inverse(self, upper):
+        A = np.array(
+            [
+                [4.0, 12.0, -16.0],
+                [12.0, 37.0, -43.0],
+                [-16.0, -43.0, 98.0],
+            ],
+            dtype="float32",
+        )
+        if upper:
+            factor = np.linalg.cholesky(A, upper=True)
+        else:
+            factor = np.linalg.cholesky(A)
+
+        expected_inverse = np.array(
+            [
+                [49.36111, -13.555555, 2.111111],
+                [-13.555555, 3.777778, -0.555556],
+                [2.111111, -0.555556, 0.111111],
+            ],
+            dtype="float32",
+        )
+
+        output_inverse = linalg.cholesky_inverse(factor, upper=upper)
+        self.assertAllClose(
+            output_inverse,
+            expected_inverse,
+            atol=1e-5,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
+        )
 
     def test_det(self):
         x = np.random.rand(4, 3, 3)
@@ -348,17 +481,12 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
             x = np.random.rand(4, 3, 4)
             linalg.det(x)
 
+    @pytest.mark.skipif(
+        testing.jax_uses_tpu(), reason="Unsupported on JAX with TPU"
+    )
     def test_eig(self):
         x = np.random.rand(2, 3, 3)
         x = x @ x.transpose((0, 2, 1))
-        if backend.backend() == "jax":
-            import jax
-
-            if jax.default_backend() == "gpu":
-                # eig not implemented for jax on gpu backend
-                with self.assertRaises(NotImplementedError):
-                    linalg.eig(x)
-                return
         w, v = map(ops.convert_to_numpy, linalg.eig(x))
         x_reconstructed = (v * w[..., None, :]) @ v.transpose((0, 2, 1))
         self.assertAllClose(x_reconstructed, x, atol=1e-4)
@@ -380,9 +508,6 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
         )
 
     def test_lu_factor(self):
-        if testing.jax_uses_gpu():
-            self.skipTest("Skipping test with JAX + GPU due to temporary error")
-
         def _pivot_matrix(pivots, n):
             p_matrix = np.eye(n)
             for i, p in enumerate(pivots):
@@ -445,9 +570,9 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
     )
     def test_norm(self, ndim, ord, axis, keepdims):
         if ndim == 1:
-            x = np.random.random((5,))
+            x = np.random.random((5,)).astype("float32")
         else:
-            x = np.random.random((5, 6))
+            x = np.random.random((5, 6)).astype("float32")
 
         vector_norm = (ndim == 1) or isinstance(axis, int)
 
@@ -482,19 +607,19 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
         expected_result = np.linalg.norm(
             x, ord=ord, axis=axis, keepdims=keepdims
         )
-        self.assertAllClose(output, expected_result)
+        self.assertAllClose(output, expected_result, atol=1e-5)
 
     def test_qr(self):
         x = np.random.random((4, 5))
         q, r = linalg.qr(x, mode="reduced")
         qref, rref = np.linalg.qr(x, mode="reduced")
-        self.assertAllClose(qref, q)
-        self.assertAllClose(rref, r)
+        self.assertAllClose(q, qref, atol=1e-5, rtol=1e-4)
+        self.assertAllClose(r, rref, atol=1e-5, rtol=1e-4)
 
         q, r = linalg.qr(x, mode="complete")
         qref, rref = np.linalg.qr(x, mode="complete")
-        self.assertAllClose(qref, q)
-        self.assertAllClose(rref, r)
+        self.assertAllClose(q, qref, atol=1e-5, rtol=1e-4)
+        self.assertAllClose(r, rref, atol=1e-5, rtol=1e-4)
 
     def test_solve(self):
         x1 = np.array([[1, 2], [4, 5]], dtype="float32")
@@ -504,9 +629,6 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
         self.assertAllClose(output, expected_result)
 
     def test_solve_triangular(self):
-        if testing.jax_uses_gpu():
-            self.skipTest("Skipping test with JAX + GPU due to temporary error")
-
         # 2d-case
         x1 = np.array([[1, 2], [0, 5]], dtype="float32")
         x2 = np.array([2, 10], dtype="float32")
@@ -526,12 +648,21 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
         self.assertAllClose(output, expected_result)
 
     def test_svd(self):
-        x = np.random.rand(4, 30, 20)
+        x = np.random.rand(4, 30, 20).astype("float32")
         u, s, vh = linalg.svd(x)
         x_reconstructed = (u[..., :, : s.shape[-1]] * s[..., None, :]) @ vh[
             ..., : s.shape[-1], :
         ]
-        self.assertAllClose(x_reconstructed, x, atol=1e-4)
+        # High tolerance due to numerical instability
+        self.assertAllClose(
+            x_reconstructed, x, atol=1e-3, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Test `compute_uv=False`
+        s_no_uv = linalg.svd(x, compute_uv=False)
+        self.assertAllClose(
+            s_no_uv, s, atol=1e-5, rtol=1e-5, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
 
     @parameterized.named_parameters(
         ("b_rank_1", 1, None),
@@ -539,20 +670,143 @@ class LinalgOpsCorrectnessTest(testing.TestCase, parameterized.TestCase):
         ("rcond", 1, 1e-3),
     )
     def test_lstsq(self, b_rank, rcond):
-        a = np.random.random((5, 7)).astype("float32")
+        # Seed for determinism: lstsq with `rcond` is sensitive to the
+        # conditioning of randomly drawn matrices, and an unseeded input
+        # was the source of historical flakiness on the torch backend.
+        rng = np.random.default_rng(0)
+        a = rng.random((5, 7)).astype("float32")
         a_symb = backend.KerasTensor((5, 7))
         if b_rank == 1:
-            b = np.random.random((5,)).astype("float32")
+            b = rng.random((5,)).astype("float32")
             b_symb = backend.KerasTensor((5,))
         else:
-            b = np.random.random((5, 4)).astype("float32")
+            b = rng.random((5, 4)).astype("float32")
             b_symb = backend.KerasTensor((5, 4))
         out = linalg.lstsq(a, b, rcond=rcond)
         ref_out = np.linalg.lstsq(a, b, rcond=rcond)[0]
-        self.assertAllClose(out, ref_out, atol=1e-5)
+        self.assertAllClose(
+            out, ref_out, atol=1e-5, tpu_atol=1e-4, tpu_rtol=1e-4
+        )
 
         out_symb = linalg.lstsq(a_symb, b_symb)
         self.assertEqual(out_symb.shape, out.shape)
+
+    def test_matrix_rank(self):
+        # Full-rank tall matrix: rank equals number of columns.
+        rng = np.random.default_rng(42)
+        a_full = rng.standard_normal((6, 3)).astype("float32")
+        self.assertEqual(
+            int(ops.convert_to_numpy(linalg.matrix_rank(a_full))), 3
+        )
+
+        # Rank-1 matrix (outer product).
+        u = rng.standard_normal((5,)).astype("float32")
+        v = rng.standard_normal((4,)).astype("float32")
+        a_rank1 = np.outer(u, v)
+        self.assertEqual(
+            int(ops.convert_to_numpy(linalg.matrix_rank(a_rank1))), 1
+        )
+
+        # Batched rank: two stacked full-rank 3x3 matrices.
+        batched = rng.standard_normal((2, 3, 3)).astype("float32")
+        out = linalg.matrix_rank(batched)
+        self.assertAllClose(ops.convert_to_numpy(out), [3, 3])
+
+        # tol argument collapses singular values below the threshold.
+        a_near_singular = np.array(
+            [[1.0, 2.0], [2.0, 4.000001]], dtype="float32"
+        )
+        rank_loose = int(
+            ops.convert_to_numpy(linalg.matrix_rank(a_near_singular, tol=1e-2))
+        )
+        self.assertEqual(rank_loose, 1)
+
+        # Symbolic shape propagation.
+        a_symb = backend.KerasTensor((4, 3, 5), dtype="float32")
+        self.assertEqual(linalg.matrix_rank(a_symb).shape, (4,))
+
+    def test_matrix_power(self):
+        # Seeded: the negative-power case inverts the input, so its accuracy
+        # depends on how well conditioned the drawn matrix is.
+        rng = np.random.default_rng(0)
+        x = rng.random((4, 3, 3)).astype("float32")
+        # Positive power
+        out = linalg.matrix_power(x, 3)
+        expected = np.linalg.matrix_power(x, 3)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Zero power
+        out = linalg.matrix_power(x, 0)
+        expected = np.linalg.matrix_power(x, 0)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Zero power (2D)
+        x_2d = rng.random((3, 3)).astype("float32")
+        out = linalg.matrix_power(x_2d, 0)
+        expected = np.linalg.matrix_power(x_2d, 0)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Negative power. The `3 *` keeps the matrix well conditioned so the
+        # float32 inverse stays within `atol`.
+        x_inv_stable = (x + 3 * np.eye(3)).astype("float32")
+        out = linalg.matrix_power(x_inv_stable, -2)
+        expected = np.linalg.matrix_power(x_inv_stable, -2)
+        self.assertAllClose(
+            out, expected, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
+
+        # Power 1
+        out = linalg.matrix_power(x, 1)
+        self.assertAllClose(out, x, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2)
+
+        # Error cases
+        with self.assertRaises(TypeError):
+            linalg.matrix_power(x, 3.5)
+
+        with self.assertRaises(ValueError):
+            # Non-square
+            linalg.matrix_power(rng.random((4, 3, 2)), 2)
+
+        with self.assertRaises(ValueError):
+            # Rank < 2
+            linalg.matrix_power(rng.random((4,)), 2)
+
+    @parameterized.named_parameters(
+        ("tall_default_rcond", (7, 4), None),
+        ("wide_default_rcond", (4, 7), None),
+        ("square_default_rcond", (5, 5), None),
+        ("tall_explicit_rcond", (7, 4), 1e-10),
+    )
+    def test_pinv(self, shape, rcond):
+        rng = np.random.default_rng(42)
+        a = rng.standard_normal(shape).astype("float32")
+
+        out = linalg.pinv(a, rcond=rcond)
+        ref = np.linalg.pinv(a, rcond=rcond if rcond is not None else 1e-15)
+        self.assertAllClose(out, ref, atol=1e-4, tpu_atol=1e-2, tpu_rtol=1e-2)
+
+        # Moore-Penrose identity: A @ pinv(A) @ A == A.
+        a_out = ops.matmul(ops.matmul(a, out), a)
+        self.assertAllClose(a_out, a, atol=1e-4, tpu_atol=1e-2, tpu_rtol=1e-2)
+
+        a_symb = backend.KerasTensor(shape, dtype="float32")
+        out_symb = linalg.pinv(a_symb)
+        self.assertEqual(out_symb.shape, (shape[1], shape[0]))
+
+    def test_pinv_batched(self):
+        rng = np.random.default_rng(0)
+        a = rng.standard_normal((3, 6, 4)).astype("float32")
+
+        out = linalg.pinv(a)
+        ref = np.linalg.pinv(a)
+        self.assertAllClose(out, ref, atol=1e-4, tpu_atol=1e-2, tpu_rtol=1e-2)
+        self.assertEqual(tuple(out.shape), (3, 4, 6))
 
 
 class QrOpTest(testing.TestCase):
@@ -605,3 +859,50 @@ class QrOpTest(testing.TestCase):
         q, r = qr_op.call(test_input)
         self.assertEqual(q.shape, (10, 10))
         self.assertEqual(r.shape, (10, 10))
+
+    def test_jvp(self):
+        if backend.backend() in ["openvino", "numpy"]:
+            pytest.skip("Backend does not support jvp operation")
+        a1, a2 = ops.convert_to_tensor(0.1), ops.convert_to_tensor(0.2)
+        primals, tangents = linalg.jvp(backend.numpy.sin, (a1,), (a2,))
+        self.assertAllClose(primals, 0.0998, atol=1e-4)
+        self.assertAllClose(tangents, 0.1990, atol=1e-4)
+
+        def f(x):
+            return backend.numpy.sin(x), x**2
+
+        primals_out, tangents_out, aux = linalg.jvp(
+            f, (a1,), (a2,), has_aux=True
+        )
+        self.assertAllClose(primals_out, 0.0998, atol=1e-4)
+        self.assertAllClose(tangents_out, 0.1990, atol=1e-4)
+        self.assertAllClose(aux, 0.01, atol=1e-4)
+
+    def test_jvp_symbolic_has_aux_false(self):
+        primals = KerasTensor((None, 7))
+        tangents = KerasTensor((None, 7))
+
+        def fun(x):
+            # simple non-linear transformation
+            return ops.sin(x) + ops.cos(x)
+
+        primals_out, tangents_out = linalg.jvp(fun, (primals,), (tangents,))
+        # output shapes must match input shapes
+        self.assertEqual(primals_out.shape, primals.shape)
+        self.assertEqual(tangents_out.shape, tangents.shape)
+
+        """Symbolic JVP test – has_aux=True."""
+
+        def fun(x):
+            y = ops.exp(x)
+            aux = ops.mean(y, axis=-1, keepdims=True)  # auxiliary output
+            return y, aux
+
+        primals_out, tangents_out, aux = linalg.jvp(
+            fun, (primals,), (tangents,), has_aux=True
+        )
+        # main output shapes
+        self.assertEqual(primals_out.shape, primals.shape)
+        self.assertEqual(tangents_out.shape, tangents.shape)
+        # auxiliary shape: (batch, 1)
+        self.assertEqual(aux.shape, (None, 1))

@@ -21,6 +21,8 @@ from keras.src.applications import resnet_v2
 from keras.src.applications import vgg16
 from keras.src.applications import vgg19
 from keras.src.applications import xception
+from keras.src.layers import Conv2D
+from keras.src.layers import Input
 from keras.src.saving import serialization_lib
 from keras.src.utils import file_utils
 from keras.src.utils import image_utils
@@ -118,7 +120,7 @@ def _get_elephant(target_size):
     reason="Env variable set to skip.",
 )
 @pytest.mark.requires_trainable_backend
-class ApplicationsTest(testing.TestCase, parameterized.TestCase):
+class ApplicationsTest(testing.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.original_image_data_format = backend.image_data_format()
@@ -148,10 +150,6 @@ class ApplicationsTest(testing.TestCase, parameterized.TestCase):
     def test_application_notop_variable_input_channels(
         self, app, last_dim, _, image_data_format
     ):
-        if app == nasnet.NASNetMobile and backend.backend() == "torch":
-            self.skipTest(
-                "NASNetMobile pretrained incorrect with torch backend."
-            )
         self.skip_if_invalid_image_data_format_for_model(app, image_data_format)
         backend.set_image_data_format(image_data_format)
 
@@ -181,10 +179,6 @@ class ApplicationsTest(testing.TestCase, parameterized.TestCase):
     def test_application_base(self, app, _, app_module, image_data_format):
         import tensorflow as tf
 
-        if app == nasnet.NASNetMobile and backend.backend() == "torch":
-            self.skipTest(
-                "NASNetMobile pretrained incorrect with torch backend."
-            )
         if (
             image_data_format == "channels_first"
             and len(tf.config.list_physical_devices("GPU")) == 0
@@ -222,10 +216,6 @@ class ApplicationsTest(testing.TestCase, parameterized.TestCase):
     def test_application_notop_custom_input_shape(
         self, app, last_dim, _, image_data_format
     ):
-        if app == nasnet.NASNetMobile and backend.backend() == "torch":
-            self.skipTest(
-                "NASNetMobile pretrained incorrect with torch backend."
-            )
         self.skip_if_invalid_image_data_format_for_model(app, image_data_format)
         backend.set_image_data_format(image_data_format)
 
@@ -240,11 +230,29 @@ class ApplicationsTest(testing.TestCase, parameterized.TestCase):
         self.assertEqual(output_shape[last_dim_axis], last_dim)
 
     @parameterized.named_parameters(test_parameters)
+    def test_application_notop_custom_input_tensor(
+        self, app, last_dim, _, image_data_format
+    ):
+        self.skip_if_invalid_image_data_format_for_model(app, image_data_format)
+        backend.set_image_data_format(image_data_format)
+
+        if image_data_format == "channels_first":
+            input_shape = (4, 200, 200)
+            last_dim_axis = 1
+        else:
+            input_shape = (200, 200, 4)
+            last_dim_axis = -1
+
+        inputs_custom = Input(shape=input_shape, name="custom_input")
+        inputs_custom = Conv2D(3, (2, 2), padding="valid", strides=(2, 2))(
+            inputs_custom
+        )
+        model = app(weights=None, include_top=False, input_tensor=inputs_custom)
+        output_shape = list(model.outputs[0].shape)
+        self.assertEqual(output_shape[last_dim_axis], last_dim)
+
+    @parameterized.named_parameters(test_parameters)
     def test_application_pooling(self, app, last_dim, _, image_data_format):
-        if app == nasnet.NASNetMobile and backend.backend() == "torch":
-            self.skipTest(
-                "NASNetMobile pretrained incorrect with torch backend."
-            )
         self.skip_if_invalid_image_data_format_for_model(app, image_data_format)
         backend.set_image_data_format(image_data_format)
 
@@ -254,11 +262,6 @@ class ApplicationsTest(testing.TestCase, parameterized.TestCase):
 
     @parameterized.named_parameters(test_parameters)
     def test_application_classifier_activation(self, app, *_):
-        if app == nasnet.NASNetMobile and backend.backend() == "torch":
-            self.skipTest(
-                "NASNetMobile pretrained incorrect with torch backend."
-            )
-
         model = app(
             weights=None, include_top=True, classifier_activation="softmax"
         )

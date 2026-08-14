@@ -1,9 +1,7 @@
 import numpy as np
-import pytest
 from absl.testing import parameterized
 from numpy.lib.stride_tricks import as_strided
 
-from keras.src import backend
 from keras.src import layers
 from keras.src import testing
 
@@ -134,8 +132,7 @@ def np_avgpool3d(x, pool_size, strides, padding, data_format):
     return out
 
 
-@pytest.mark.requires_trainable_backend
-class AveragePoolingBasicTest(testing.TestCase, parameterized.TestCase):
+class AveragePoolingBasicTest(testing.TestCase):
     @parameterized.parameters(
         (2, 1, "valid", "channels_last", (3, 5, 4), (3, 4, 4)),
         (2, 1, "same", "channels_first", (3, 5, 4), (3, 5, 4)),
@@ -164,12 +161,18 @@ class AveragePoolingBasicTest(testing.TestCase, parameterized.TestCase):
             expected_num_non_trainable_weights=0,
             expected_num_losses=0,
             supports_masking=False,
+            run_mixed_precision_check=False,
+            assert_built_after_instantiation=True,
         )
 
     @parameterized.parameters(
         (2, 1, "valid", "channels_last", (3, 5, 5, 4), (3, 4, 4, 4)),
+        (2, 1, "same", "channels_last", (3, 5, 5, 4), (3, 5, 5, 4)),
+        (2, 1, "valid", "channels_first", (3, 5, 5, 4), (3, 5, 4, 3)),
         (2, 1, "same", "channels_first", (3, 5, 5, 4), (3, 5, 5, 4)),
         ((2, 3), (2, 2), "valid", "channels_last", (3, 5, 5, 4), (3, 2, 2, 4)),
+        ((2, 3), (2, 2), "same", "channels_last", (3, 5, 5, 4), (3, 3, 3, 4)),
+        ((2, 3), (3, 3), "same", "channels_first", (3, 5, 5, 4), (3, 5, 2, 2)),
     )
     def test_average_pooling2d(
         self,
@@ -194,6 +197,8 @@ class AveragePoolingBasicTest(testing.TestCase, parameterized.TestCase):
             expected_num_non_trainable_weights=0,
             expected_num_losses=0,
             supports_masking=False,
+            run_mixed_precision_check=False,
+            assert_built_after_instantiation=True,
         )
 
     @parameterized.parameters(
@@ -233,10 +238,11 @@ class AveragePoolingBasicTest(testing.TestCase, parameterized.TestCase):
             supports_masking=False,
             # Incomplete op support on tensorflow.
             run_mixed_precision_check=False,
+            assert_built_after_instantiation=True,
         )
 
 
-class AveragePoolingCorrectnessTest(testing.TestCase, parameterized.TestCase):
+class AveragePoolingCorrectnessTest(testing.TestCase):
     @parameterized.parameters(
         (2, 1, "valid", "channels_last"),
         (2, 1, "valid", "channels_first"),
@@ -263,10 +269,6 @@ class AveragePoolingCorrectnessTest(testing.TestCase, parameterized.TestCase):
         (2, 1, "same", "channels_first"),
         ((2,), (2,), "same", "channels_last"),
         ((2,), (2,), "same", "channels_first"),
-    )
-    @pytest.mark.skipif(
-        backend.backend() == "torch",
-        reason="Same padding in Torch backend produces different results.",
     )
     def test_average_pooling1d_same_padding(
         self, pool_size, strides, padding, data_format
@@ -308,10 +310,6 @@ class AveragePoolingCorrectnessTest(testing.TestCase, parameterized.TestCase):
         (2, (2, 1), "same", "channels_first"),
         ((2, 2), (2, 2), "same", "channels_last"),
         ((2, 2), (2, 2), "same", "channels_first"),
-    )
-    @pytest.mark.skipif(
-        backend.backend() == "torch",
-        reason="Same padding in Torch backend produces different results.",
     )
     def test_average_pooling2d_same_padding(
         self, pool_size, strides, padding, data_format
@@ -355,10 +353,6 @@ class AveragePoolingCorrectnessTest(testing.TestCase, parameterized.TestCase):
         (2, 1, "same", "channels_first"),
         ((2, 2, 2), (2, 2, 1), "same", "channels_last"),
         ((2, 2, 2), (2, 2, 1), "same", "channels_first"),
-    )
-    @pytest.mark.skipif(
-        backend.backend() == "torch",
-        reason="Same padding in Torch backend produces different results.",
     )
     def test_average_pooling3d_same_padding(
         self, pool_size, strides, padding, data_format

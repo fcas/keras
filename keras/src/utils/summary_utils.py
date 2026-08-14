@@ -1,3 +1,4 @@
+import functools
 import math
 import re
 import shutil
@@ -21,6 +22,14 @@ def count_params(weights):
     return int(sum(math.prod(p) for p in shapes))
 
 
+@functools.lru_cache(512)
+def _compute_memory_size(shape, dtype):
+    weight_counts = math.prod(shape)
+    dtype = backend.standardize_dtype(dtype)
+    per_param_size = dtype_utils.dtype_size(dtype)
+    return weight_counts * per_param_size
+
+
 def weight_memory_size(weights):
     """Compute the memory footprint for weights based on their dtypes.
 
@@ -33,10 +42,7 @@ def weight_memory_size(weights):
     unique_weights = {id(w): w for w in weights}.values()
     total_memory_size = 0
     for w in unique_weights:
-        weight_shape = math.prod(w.shape)
-        dtype = backend.standardize_dtype(w.dtype)
-        per_param_size = dtype_utils.dtype_size(dtype)
-        total_memory_size += weight_shape * per_param_size
+        total_memory_size += _compute_memory_size(w.shape, w.dtype)
     return total_memory_size / 8
 
 
@@ -76,20 +82,38 @@ def bold_text(x, color=None):
 
 
 def format_layer_shape(layer):
-    if not layer._inbound_nodes:
+    if not layer._inbound_nodes and not layer._build_shapes_dict:
         return "?"
 
     def format_shape(shape):
         highlighted = [highlight_number(x) for x in shape]
-        return "(" + ", ".join(highlighted) + ")"
+        return f"({', '.join(highlighted)})"
 
-    for i in range(len(layer._inbound_nodes)):
-        outputs = layer._inbound_nodes[i].output_tensors
-        output_shapes = tree.map_structure(
-            lambda x: format_shape(x.shape), outputs
-        )
-    if len(output_shapes) == 1:
-        return output_shapes[0]
+    # There are 2 approaches to get output shapes:
+    # 1. Using `layer._inbound_nodes`, which is possible if the model is a
+    # Sequential or Functional.
+    # 2. Using `layer._build_shapes_dict`, which is possible if users manually
+    # build the layer.
+    if len(layer._inbound_nodes) > 0:
+        for i in range(len(layer._inbound_nodes)):
+            outputs = layer._inbound_nodes[i].output_tensors
+            output_shapes = tree.map_structure(
+                lambda x: format_shape(x.shape), outputs
+            )
+    else:
+        try:
+            if hasattr(layer, "output_shape"):
+                output_shapes = format_shape(layer.output_shape)
+            else:
+                outputs = layer.compute_output_shape(**layer._build_shapes_dict)
+                output_shapes = tree.map_shape_structure(
+                    lambda x: format_shape(x), outputs
+                )
+        except NotImplementedError:
+            return "?"
+    flat_output_shapes = tree.flatten(output_shapes)
+    if len(flat_output_shapes) == 1:
+        return flat_output_shapes[0]
     out = str(output_shapes)
     out = out.replace("'", "")
     return out
@@ -245,7 +269,7 @@ def print_summary(
 
     def get_layer_fields(layer, prefix=""):
         output_shape = format_layer_shape(layer)
-        name = prefix + layer.name
+        name = f"{prefix}{layer.name}"
         cls_name = layer.__class__.__name__
         name = rich.markup.escape(name)
         name += f" ({highlight_symbol(rich.markup.escape(cls_name))})"
@@ -253,7 +277,7 @@ def print_summary(
         if not hasattr(layer, "built"):
             params = highlight_number(0)
         elif not layer.built:
-            params = highlight_number(0) + " (unbuilt)"
+            params = f"{highlight_number(0)} (unbuilt)"
         else:
             params = highlight_number(f"{layer.count_params():,}")
 
@@ -261,7 +285,7 @@ def print_summary(
         if not sequential_like:
             fields.append(get_connections(layer))
         if show_trainable:
-            if layer.weights:
+            if hasattr(layer, "weights") and len(layer.weights) > 0:
                 fields.append(
                     bold_text("Y", color=34)
                     if layer.trainable
@@ -273,7 +297,7 @@ def print_summary(
 
     def print_layer(layer, nested_level=0):
         if nested_level:
-            prefix = "   " * nested_level + "└" + " "
+            prefix = "   " * nested_level + "└ "
         else:
             prefix = ""
 
@@ -418,3 +442,89 @@ def get_layer_index_bound_by_layer_name(layers, layer_range=None):
     if min(lower_index) > max(upper_index):
         return [min(upper_index), max(lower_index) + 1]
     return [min(lower_index), max(upper_index) + 1]
+
+
+def print_quantization_summary(model, verbose=True):
+    """Build (and optionally print) a per-quantized-layer summary of a model.
+
+    See `Model.quantization_summary` for a description of the reported fields.
+
+    Args:
+        model: Keras model instance.
+        verbose: Whether to print the summary. Defaults to `True`. The summary
+            string is always returned.
+
+    Returns:
+        The summary as a string.
+    """
+
+    def _weight_bytes(weight):
+        num_elements = math.prod(weight.shape)
+        dtype = backend.standardize_dtype(weight.dtype)
+        return num_elements * dtype_utils.dtype_size(dtype) // 8
+
+    rows = []
+    total_quantized_bytes = 0
+    total_float_bytes = 0
+    total_logical_params = 0
+    for layer in model._flatten_layers():
+        # Only leaf layers (those without sub-layers) are quantizable.
+        if len(list(layer._flatten_layers())) != 1:
+            continue
+        mode = layer.quantization_mode
+        if mode is None:
+            continue
+        weights = list(layer.weights)
+        if not weights:
+            continue
+
+        # The primary quantized weight is the largest one (the kernel).
+        primary = max(weights, key=lambda w: math.prod(w.shape))
+        storage_dtype = backend.standardize_dtype(primary.dtype)
+        storage_bytes = _weight_bytes(primary)
+
+        # 4-bit modes pack two values per stored byte, so the logical
+        # (unpacked) element count is twice the stored count.
+        multiplier = 2 if mode in ("int4", "gptq", "awq") else 1
+        logical_params = math.prod(primary.shape) * multiplier
+        float_bytes = logical_params * 4  # float32 baseline.
+
+        rows.append(
+            {
+                "path": layer.path or layer.name,
+                "policy": layer.dtype_policy.name,
+                "dtype": storage_dtype,
+                "bytes": storage_bytes,
+            }
+        )
+        total_quantized_bytes += storage_bytes
+        total_float_bytes += float_bytes
+        total_logical_params += logical_params
+
+    lines = [f"Quantization summary for '{model.name}'", "=" * 65]
+    if not rows:
+        lines.append("No quantized layers found.")
+    else:
+        for row in rows:
+            lines.append(f"Layer: {row['path']}")
+            lines.append(f"  dtype policy : {row['policy']}")
+            lines.append(
+                f"  weight store : {row['dtype']} ({row['bytes']} bytes)"
+            )
+        lines.append("-" * 65)
+        lines.append(f"Quantized layers : {len(rows)}")
+        lines.append(f"Quantized params : {total_logical_params}")
+        ratio = (
+            total_float_bytes / total_quantized_bytes
+            if total_quantized_bytes
+            else 0.0
+        )
+        lines.append(
+            f"Weight storage   : {total_quantized_bytes} bytes quantized "
+            f"vs {total_float_bytes} bytes float32 "
+            f"({ratio:.2f}x smaller)"
+        )
+    summary = "\n".join(lines)
+    if verbose:
+        io_utils.print_msg(summary)
+    return summary

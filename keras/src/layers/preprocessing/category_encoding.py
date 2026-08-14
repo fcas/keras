@@ -1,11 +1,12 @@
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
-from keras.src.layers.preprocessing.tf_data_layer import TFDataLayer
+from keras.src.layers.preprocessing.data_layer import DataLayer
 from keras.src.utils import backend_utils
+from keras.src.utils import numerical_utils
 
 
 @keras_export("keras.layers.CategoryEncoding")
-class CategoryEncoding(TFDataLayer):
+class CategoryEncoding(DataLayer):
     """A preprocessing layer which encodes integer features.
 
     This layer provides options for condensing data into a categorical encoding
@@ -14,7 +15,7 @@ class CategoryEncoding(TFDataLayer):
     inputs. For integer inputs where the total number of tokens is not known,
     use `keras.layers.IntegerLookup` instead.
 
-    **Note:** This layer is safe to use inside a `tf.data` pipeline
+    **Note:** This layer is safe to use inside a `tf.data` or `grain` pipeline
     (independently of which backend you're using).
 
     Examples:
@@ -113,70 +114,29 @@ class CategoryEncoding(TFDataLayer):
         self._allow_non_tensor_positional_args = True
         self._convert_input_args = False
 
-    def _count(self, inputs, axis=-1, count_weights=None):
-        # We don't use `ops.bincount` here because its output has a dynamic
-        # shape (the last dimension is calculated from the highest value of
-        # `inputs`). Instead, we reimplement a narrower use case where
-        # `minlength` and `maxlength` (not supported by `ops.bincount`) are a
-        # static value and the same value of `self.num_tokens`. Also, we don't
-        # need to support indices that are negative or greater than
-        # `self.num_tokens`.
-        reduction_axis = 1 if len(inputs.shape) > 1 else 0
-
-        one_hot_encoding = self.backend.nn.one_hot(
+    def _encode(self, inputs, count_weights=None):
+        inputs = self.backend.core.convert_to_tensor(inputs)
+        return numerical_utils.encode_categorical_inputs(
             inputs,
-            self.num_tokens,
-            axis=axis,
+            output_mode=self.output_mode,
+            depth=self.num_tokens,
             dtype=self.dtype,
             sparse=self.sparse,
+            count_weights=count_weights,
+            backend_module=self.backend,
         )
-        if count_weights is not None:
-            split_weights = self.backend.numpy.split(
-                count_weights,
-                count_weights.shape[reduction_axis],
-                reduction_axis,
-            )
-            stacked_weights = self.backend.numpy.stack(
-                split_weights, axis=reduction_axis
-            )
-            one_hot_encoding = one_hot_encoding * stacked_weights
-
-        outputs = self.backend.numpy.sum(
-            one_hot_encoding,
-            axis=reduction_axis,
-        )
-        return outputs
-
-    def _encode(self, inputs, count_weights=None):
-        if self.output_mode == "multi_hot":
-            return self.backend.nn.multi_hot(
-                inputs, self.num_tokens, dtype=self.dtype, sparse=self.sparse
-            )
-        elif self.output_mode == "one_hot":
-            return self.backend.nn.one_hot(
-                inputs, self.num_tokens, dtype=self.dtype, sparse=self.sparse
-            )
-        elif self.output_mode == "count":
-            return self._count(inputs, count_weights=count_weights)
 
     def compute_output_shape(self, input_shape):
-        # Treat rank-0 inputs inconsistent with actual output .
         if (input_shape is not None) & (len(input_shape) == 0):
-            # If output_mode == "multi_hot" return same shape .
-            if self.output_mode == "multi_hot":
-                return input_shape
-            # If output_mode == "one_hot" append num_tokens to shape .
-            # This is inline with actual output .
-            elif self.output_mode == "one_hot":
-                return (self.num_tokens,)
+            return (self.num_tokens,)
         if self.output_mode == "one_hot":
             if input_shape[-1] != 1:
-                return tuple(input_shape + (self.num_tokens,))
+                return tuple(input_shape) + (self.num_tokens,)
             elif len(input_shape) == 1:
-                return tuple(input_shape + (self.num_tokens,))
+                return tuple(input_shape) + (self.num_tokens,)
             else:
-                return tuple(input_shape[:-1] + (self.num_tokens,))
-        return tuple(input_shape[:-1] + (self.num_tokens,))
+                return tuple(input_shape[:-1]) + (self.num_tokens,)
+        return tuple(input_shape[:-1]) + (self.num_tokens,)
 
     def compute_output_spec(self, inputs, count_weights=None):
         output_shape = self.compute_output_shape(inputs.shape)
@@ -188,6 +148,7 @@ class CategoryEncoding(TFDataLayer):
         config = {
             "num_tokens": self.num_tokens,
             "output_mode": self.output_mode,
+            "sparse": self.sparse,
         }
         base_config = super().get_config()
         return {**base_config, **config}
@@ -197,7 +158,7 @@ class CategoryEncoding(TFDataLayer):
             if self.output_mode != "count":
                 raise ValueError(
                     "`count_weights` is not used when `output_mode` is not "
-                    "`'count'`. Received `count_weights={count_weights}`."
+                    f"`'count'`. Received `count_weights={count_weights}`."
                 )
             count_weights = self.backend.convert_to_tensor(
                 count_weights, dtype=self.compute_dtype

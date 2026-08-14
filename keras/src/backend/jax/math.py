@@ -3,10 +3,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from keras.src.backend import config
 from keras.src.backend import standardize_dtype
-from keras.src.backend.common import dtypes
-from keras.src.backend.jax.core import cast
 from keras.src.backend.jax.core import convert_to_tensor
 from keras.src.utils.module_utils import scipy
 
@@ -33,36 +30,64 @@ def segment_max(data, segment_ids, num_segments=None, sorted=False):
     )
 
 
-def top_k(x, k, sorted=True):
-    # Jax does not supported `sorted`, but in the case where `sorted=False`,
+def segment_min(data, segment_ids, num_segments=None, sorted=False):
+    if num_segments is None:
+        raise ValueError(
+            "Argument `num_segments` must be set when using the JAX backend. "
+            "Received: num_segments=None"
+        )
+    return jax.ops.segment_min(
+        data, segment_ids, num_segments, indices_are_sorted=sorted
+    )
+
+
+def segment_prod(data, segment_ids, num_segments=None, sorted=False):
+    if num_segments is None:
+        raise ValueError(
+            "Argument `num_segments` must be set when using the JAX backend. "
+            "Received: num_segments=None"
+        )
+    return jax.ops.segment_prod(
+        data, segment_ids, num_segments, indices_are_sorted=sorted
+    )
+
+
+def top_k(x, k, sorted=True, is_stable=True):
+    # Jax does not support `sorted`, but in the case where `sorted=False`,
     # order is not guaranteed, so OK to return sorted output.
-    return jax.lax.top_k(x, k)
+    try:
+        # is_stable was added in JAX version 0.11.0
+        return jax.lax.top_k(x, k, is_stable=is_stable)
+    except TypeError:
+        return jax.lax.top_k(x, k)
 
 
 def in_top_k(targets, predictions, k):
-    targets = targets[..., None]
-    topk_values = top_k(predictions, k)[0]
-    targets_values = jnp.take_along_axis(predictions, targets, axis=-1)
-    mask = targets_values >= topk_values
-    return jnp.any(mask, axis=1)
+    preds_at_label = jnp.take_along_axis(
+        predictions, jnp.expand_dims(targets, axis=-1), axis=-1
+    )
+    # `nan` shouldn't be considered as large probability.
+    preds_at_label = jnp.where(
+        jnp.isnan(preds_at_label), -jnp.inf, preds_at_label
+    )
+    rank = 1 + jnp.sum(jnp.greater(predictions, preds_at_label), axis=-1)
+    return jnp.less_equal(rank, k)
 
 
 def logsumexp(x, axis=None, keepdims=False):
-    max_x = jnp.max(x, axis=axis, keepdims=True)
-    result = (
-        jnp.log(jnp.sum(jnp.exp(x - max_x), axis=axis, keepdims=True)) + max_x
-    )
-    return jnp.squeeze(result) if not keepdims else result
+    x = convert_to_tensor(x)
+    return jax.scipy.special.logsumexp(x, axis=axis, keepdims=keepdims)
 
 
-def qr(x, mode="reduced"):
-    if mode not in {"reduced", "complete"}:
-        raise ValueError(
-            "`mode` argument value not supported. "
-            "Expected one of {'reduced', 'complete'}. "
-            f"Received: mode={mode}"
-        )
-    return jnp.linalg.qr(x, mode=mode)
+def cdist(x, y):
+    x = jnp.asarray(x)
+    y = jnp.asarray(y)
+    if x.ndim < 2 or y.ndim < 2:
+        raise ValueError("`cdist` inputs must have rank >= 2")
+    if x.shape[-1] != y.shape[-1]:
+        raise ValueError("Last dimension of inputs to `cdist` must match")
+    diff = jnp.expand_dims(x, -2) - jnp.expand_dims(y, -3)
+    return jnp.sqrt(jnp.sum(diff * diff, axis=-1))
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -116,6 +141,12 @@ def fft(x):
 def fft2(x):
     complex_input = _get_complex_tensor_from_tuple(x)
     complex_output = jnp.fft.fft2(complex_input)
+    return jnp.real(complex_output), jnp.imag(complex_output)
+
+
+def ifft2(x):
+    complex_input = _get_complex_tensor_from_tuple(x)
+    complex_output = jnp.fft.ifft2(complex_input)
     return jnp.real(complex_output), jnp.imag(complex_output)
 
 
@@ -249,13 +280,14 @@ def istft(
     if length is not None:
         end = start + length
     elif center is True:
-        end = -(fft_length // 2)
+        end = expected_output_len - (fft_length // 2)
     else:
         end = expected_output_len
     return x[..., start:end]
 
 
 def rsqrt(x):
+    x = convert_to_tensor(x)
     return jax.lax.rsqrt(x)
 
 
@@ -263,21 +295,26 @@ def erf(x):
     return jax.lax.erf(x)
 
 
-def erfinv(x):
-    return jax.lax.erf_inv(x)
-
-
-def solve(a, b):
-    a = convert_to_tensor(a)
-    b = convert_to_tensor(b)
-    return jnp.linalg.solve(a, b)
-
-
-def norm(x, ord=None, axis=None, keepdims=False):
+def erfc(x):
     x = convert_to_tensor(x)
-    if standardize_dtype(x.dtype) == "int64":
-        dtype = config.floatx()
-    else:
-        dtype = dtypes.result_type(x.dtype, float)
-    x = cast(x, dtype)
-    return jnp.linalg.norm(x, ord=ord, axis=axis, keepdims=keepdims)
+    return jax.scipy.special.erfc(x)
+
+
+def erfinv(x):
+    x = convert_to_tensor(x)
+    return jax.scipy.special.erfinv(x)
+
+
+def logdet(x):
+    from keras.src.backend.jax.numpy import slogdet
+
+    # In JAX (like in NumPy) slogdet is more stable than
+    # `np.log(np.linalg.det(x))`. See
+    # https://numpy.org/doc/stable/reference/generated/numpy.linalg.slogdet.html
+    return slogdet(x)[1]
+
+
+def gammainc(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jax.scipy.special.gammainc(x1, x2)

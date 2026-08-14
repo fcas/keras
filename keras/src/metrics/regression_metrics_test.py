@@ -21,7 +21,7 @@ class MeanSquaredErrorTest(testing.TestCase):
 
         mse_obj.update_state(y_true, y_pred)
         result = mse_obj.result()
-        self.assertAllClose(0.5, result, atol=1e-5)
+        self.assertAllClose(result, 0.5, atol=1e-5)
 
     def test_weighted(self):
         mse_obj = metrics.MeanSquaredError()
@@ -33,7 +33,7 @@ class MeanSquaredErrorTest(testing.TestCase):
         )
         sample_weight = np.array([1.0, 1.5, 2.0, 2.5])
         result = mse_obj(y_true, y_pred, sample_weight=sample_weight)
-        self.assertAllClose(0.54285, result, atol=1e-5)
+        self.assertAllClose(result, 0.54285, atol=1e-5)
 
 
 class CosineSimilarityTest(testing.TestCase):
@@ -115,7 +115,7 @@ class MeanAbsoluteErrorTest(testing.TestCase):
 
         mae_obj.update_state(y_true, y_pred)
         result = mae_obj.result()
-        self.assertAllClose(0.5, result, atol=1e-5)
+        self.assertAllClose(result, 0.5, atol=1e-5)
 
     def test_weighted(self):
         mae_obj = metrics.MeanAbsoluteError()
@@ -127,7 +127,7 @@ class MeanAbsoluteErrorTest(testing.TestCase):
         )
         sample_weight = np.array([1.0, 1.5, 2.0, 2.5])
         result = mae_obj(y_true, y_pred, sample_weight=sample_weight)
-        self.assertAllClose(0.54285, result, atol=1e-5)
+        self.assertAllClose(result, 0.54285, atol=1e-5)
 
 
 class MeanAbsolutePercentageErrorTest(testing.TestCase):
@@ -161,7 +161,7 @@ class MeanAbsolutePercentageErrorTest(testing.TestCase):
         )
 
         result = mape_obj(y_true, y_pred)
-        self.assertAllClose(35e7, result, atol=1e-5)
+        self.assertAllClose(result, 35e7, atol=1e-5)
 
     def test_weighted(self):
         mape_obj = metrics.MeanAbsolutePercentageError()
@@ -180,7 +180,7 @@ class MeanAbsolutePercentageErrorTest(testing.TestCase):
 
         sample_weight = np.array([1.0, 1.5, 2.0, 2.5])
         result = mape_obj(y_true, y_pred, sample_weight=sample_weight)
-        self.assertAllClose(40e7, result, atol=1e-5)
+        self.assertAllClose(result, 40e7, atol=1e-5)
 
 
 class MeanSquaredLogarithmicErrorTest(testing.TestCase):
@@ -209,7 +209,7 @@ class MeanSquaredLogarithmicErrorTest(testing.TestCase):
 
         msle_obj.update_state(y_true, y_pred)
         result = msle_obj.result()
-        self.assertAllClose(0.24022, result, atol=1e-5)
+        self.assertAllClose(result, 0.24022, atol=1e-5)
 
     def test_weighted(self):
         msle_obj = metrics.MeanSquaredLogarithmicError()
@@ -221,7 +221,7 @@ class MeanSquaredLogarithmicErrorTest(testing.TestCase):
         )
         sample_weight = np.array([1.0, 1.5, 2.0, 2.5])
         result = msle_obj(y_true, y_pred, sample_weight=sample_weight)
-        self.assertAllClose(0.26082, result, atol=1e-5)
+        self.assertAllClose(result, 0.26082, atol=1e-5)
 
 
 class RootMeanSquaredErrorTest(testing.TestCase):
@@ -299,7 +299,7 @@ class LogCoshErrorTest(testing.TestCase):
         self.assertAllClose(result, expected_result, atol=1e-3)
 
 
-class R2ScoreTest(parameterized.TestCase, testing.TestCase):
+class R2ScoreTest(testing.TestCase):
     def _run_test(
         self,
         y_true,
@@ -331,6 +331,7 @@ class R2ScoreTest(parameterized.TestCase, testing.TestCase):
     @parameterized.parameters(
         # class_aggregation, num_regressors, result
         (None, 0, [0.37, -1.295, 0.565]),
+        (None, 1, [-0.26, -3.59, 0.13]),
         ("uniform_average", 0, -0.12),
         ("variance_weighted_average", 0, -0.12),
     )
@@ -351,14 +352,14 @@ class R2ScoreTest(parameterized.TestCase, testing.TestCase):
     @parameterized.parameters(
         # class_aggregation, num_regressors, result
         (None, 0, [0.17305559, -8.836666, -0.521]),
-        (None, 1, [0.054920673, -10.241904, -0.7382858]),
-        (None, 2, [-0.10259259, -12.115555, -1.0280001]),
+        (None, 1, [-0.65388882, -18.673332, -2.042]),
+        (None, 2, [0.17305559, -8.836666, -0.521]),
         ("uniform_average", 0, -3.0615367889404297),
-        ("uniform_average", 1, -3.641756534576416),
-        ("uniform_average", 2, -4.415382385253906),
+        ("uniform_average", 1, -7.123073577880859),
+        ("uniform_average", 2, -3.0615367889404297),
         ("variance_weighted_average", 0, -1.3710224628448486),
-        ("variance_weighted_average", 1, -1.7097399234771729),
-        ("variance_weighted_average", 2, -2.161363363265991),
+        ("variance_weighted_average", 1, -3.742044448852539),
+        ("variance_weighted_average", 2, -1.3710224628448486),
     )
     def test_r2_tfa_comparison(self, class_aggregation, num_regressors, result):
         y_true = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]

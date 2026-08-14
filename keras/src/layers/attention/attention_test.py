@@ -41,6 +41,13 @@ class AttentionTest(testing.TestCase):
             run_training_check=False,
         )
 
+    def test_attention_seed_preserved_in_config(self):
+        layer = layers.Attention(dropout=0.5, seed=1337)
+        config = layer.get_config()
+        self.assertEqual(config["seed"], 1337)
+        restored = layers.Attention.from_config(config)
+        self.assertEqual(restored.seed, 1337)
+
     def test_attention_correctness(self):
         query = np.array([[[1.0, 0.0], [0.0, 1.0]]])
         key = np.array([[[0.0, 1.0], [1.0, 0.0]]])
@@ -53,10 +60,18 @@ class AttentionTest(testing.TestCase):
             return_attention_scores=True,
         )
         self.assertAllClose(
-            output, [[[2.462, 3.462], [1.538, 2.538]]], atol=1e-3
+            output,
+            [[[2.462, 3.462], [1.538, 2.538]]],
+            atol=1e-3,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
         )
         self.assertAllClose(
-            scores, [[[0.269, 0.731], [0.731, 0.269]]], atol=1e-3
+            scores,
+            [[[0.269, 0.731], [0.731, 0.269]]],
+            atol=1e-3,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
         )
 
         # Concat.
@@ -66,10 +81,18 @@ class AttentionTest(testing.TestCase):
             return_attention_scores=True,
         )
         self.assertAllClose(
-            output, [[[1.727, 2.727], [2.272, 3.272]]], atol=1e-3
+            output,
+            [[[1.727, 2.727], [2.272, 3.272]]],
+            atol=1e-3,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
         )
         self.assertAllClose(
-            scores, [[[0.636, 0.363], [0.363, 0.636]]], atol=1e-3
+            scores,
+            [[[0.636, 0.363], [0.363, 0.636]]],
+            atol=1e-3,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
         )
 
     def test_attention_with_mask(self):
@@ -85,6 +108,23 @@ class AttentionTest(testing.TestCase):
         )
         self.assertAllClose(output, [[[1.0, 1.0], [0.0, 0.0]]])
         self.assertAllClose(scores, [[[1.0, 0.0], [1.0, 0.0]]])
+
+    def test_attention_2D_mask_shape_mismatch(self):
+        layer = layers.Attention()
+        batch_size, Tq, Tv, dim = 2, 3, 4, 5
+        query = np.random.random((batch_size, Tq, dim)).astype(np.float32)
+        value = np.random.random((batch_size, Tv, dim)).astype(np.float32)
+        query_mask = np.array([[True, False, True], [True, False, True]])
+        value_mask = np.array(
+            [[True, False, True, True], [True, False, True, True]]
+        )
+        output, scores = layer(
+            [query, value],
+            mask=[query_mask, value_mask],
+            return_attention_scores=True,
+        )
+        self.assertEqual(output.shape, (batch_size, Tq, dim))
+        self.assertEqual(scores.shape, (batch_size, Tq, Tv))
 
     def test_attention_errors(self):
         layer = layers.Attention()
@@ -132,7 +172,9 @@ class AttentionTest(testing.TestCase):
         expected_scores = np.matmul(query, key.transpose((0, 2, 1)))
         expected_scores *= layer.scale.numpy()
         actual_scores = layer._calculate_scores(query, key)
-        self.assertAllClose(actual_scores, expected_scores)
+        self.assertAllClose(
+            actual_scores, expected_scores, tpu_atol=1e-2, tpu_rtol=1e-2
+        )
 
     def test_attention_calculate_score_mask_no_causal_no_vmask(self):
         scores = np.random.random((2, 3, 4))
@@ -351,10 +393,117 @@ class AttentionTest(testing.TestCase):
         key = np.random.random((2, 3, 4))
         layer = layers.Attention()
         output = layer([query, value, key])
-        self.assertAllEqual(output.shape, value.shape)
-        self.assertAllEqual(
+        self.assertEqual(output.shape, value.shape)
+        self.assertEqual(
             layer.compute_output_shape(
                 input_shape=[query.shape, value.shape, key.shape]
             ),
             output.shape,
+        )
+
+    def test_attention_nd_inputs(self):
+        """Test that Attention handles N-D inputs (e.g. 4D from Conv2D)."""
+        layer = layers.Attention()
+        # 4D inputs: (batch, height, width, channels)
+        query = np.random.random((2, 8, 6, 4)).astype(np.float32)
+        value = np.random.random((2, 8, 6, 4)).astype(np.float32)
+        output = layer([query, value])
+        self.assertEqual(output.shape, (2, 8, 6, 4))
+
+        # With return_attention_scores
+        output, scores = layer([query, value], return_attention_scores=True)
+        self.assertEqual(output.shape, (2, 8, 6, 4))
+        self.assertEqual(scores.shape, (2, 8, 6, 6))
+
+    def test_return_attention_scores_true(self):
+        """Test that the layer returns attention scores along with outputs."""
+        # Generate dummy input data
+        query = np.random.random((2, 8, 16)).astype(np.float32)
+        value = np.random.random((2, 4, 16)).astype(np.float32)
+
+        # Initialize the Attention layer
+        layer = layers.Attention()
+
+        # Call the layer with return_attention_scores=True
+        output, attention_scores = layer(
+            [query, value], return_attention_scores=True
+        )
+
+        # Check the shape of the outputs
+        self.assertEqual(output.shape, (2, 8, 16))  # Output shape
+        self.assertEqual(
+            attention_scores.shape, (2, 8, 4)
+        )  # Attention scores shape
+
+    def test_return_attention_scores_true_and_tuple(self):
+        """Test that the layer outputs are a tuple when
+        return_attention_scores=True."""
+        # Generate dummy input data
+        query = np.random.random((2, 8, 16)).astype(np.float32)
+        value = np.random.random((2, 4, 16)).astype(np.float32)
+
+        # Initialize the Attention layer
+        layer = layers.Attention()
+
+        # Call the layer with return_attention_scores=True
+        outputs = layer([query, value], return_attention_scores=True)
+
+        # Check that outputs is a tuple
+        self.assertIsInstance(
+            outputs, tuple, "Expected the outputs to be a tuple"
+        )
+
+    def test_return_attention_scores_true_tuple_then_unpack(self):
+        """Test that outputs can be unpacked correctly."""
+        # Generate dummy input data
+        query = np.random.random((2, 8, 16)).astype(np.float32)
+        value = np.random.random((2, 4, 16)).astype(np.float32)
+
+        # Initialize the Attention layer
+        layer = layers.Attention()
+
+        # Call the layer with return_attention_scores=True
+        outputs = layer([query, value], return_attention_scores=True)
+
+        # Unpack the outputs
+        output, attention_scores = outputs
+
+        # Check the shape of the unpacked outputs
+        self.assertEqual(output.shape, (2, 8, 16))  # Output shape
+        self.assertEqual(
+            attention_scores.shape, (2, 8, 4)
+        )  # Attention scores shape
+
+    def test_return_attention_scores_with_symbolic_tensors(self):
+        """Test to check outputs with symbolic tensors with
+        return_attention_scores = True"""
+        attention = layers.Attention()
+        x = layers.Input(shape=(3, 5))
+        y = layers.Input(shape=(4, 5))
+        output, attention_scores = attention(
+            [x, y], return_attention_scores=True
+        )
+        self.assertEqual(output.shape, (None, 3, 5))  # Output shape
+        self.assertEqual(attention_scores.shape, (None, 3, 4))
+
+    def test_symbolic_call_does_not_leak_return_attention_scores(self):
+        # `Attention` used to stash `return_attention_scores` on an instance
+        # flag in `call()`, so a later symbolic call that set it to `False`
+        # still returned a `(output, scores)` tuple from `compute_output_spec`
+        # and `compute_output_shape`. Both paths must trust only the explicit
+        # argument.
+        attention = layers.Attention()
+        q_eager = np.random.rand(2, 3, 5).astype("float32")
+        v_eager = np.random.rand(2, 4, 5).astype("float32")
+        attention([q_eager, v_eager], return_attention_scores=True)
+
+        x = layers.Input(shape=(3, 5))
+        y = layers.Input(shape=(4, 5))
+        output = attention([x, y])
+        self.assertNotIsInstance(output, (tuple, list))
+        self.assertEqual(output.shape, (None, 3, 5))
+
+        self.assertEqual(
+            attention.compute_output_shape([x.shape, y.shape]),
+            (None, 3, 5),
         )

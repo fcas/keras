@@ -31,7 +31,7 @@ def example_generator(x, y, sample_weight=None, batch_size=32):
     return make
 
 
-class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
+class GeneratorDataAdapterTest(testing.TestCase):
     @parameterized.named_parameters(
         named_product(
             [
@@ -65,18 +65,20 @@ class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
         )
 
         adapter = generator_data_adapter.GeneratorDataAdapter(make_generator())
-        if backend.backend() == "numpy":
-            it = adapter.get_numpy_iterator()
-            expected_class = np.ndarray
-        elif backend.backend() == "tensorflow":
+        if backend.backend() == "tensorflow":
             it = adapter.get_tf_dataset()
             expected_class = tf.Tensor
         elif backend.backend() == "jax":
             it = adapter.get_jax_iterator()
-            expected_class = jax.Array
+            expected_class = (
+                jax.Array if generator_type == "jax" else np.ndarray
+            )
         elif backend.backend() == "torch":
             it = adapter.get_torch_dataloader()
             expected_class = torch.Tensor
+        else:
+            it = adapter.get_numpy_iterator()
+            expected_class = np.ndarray
 
         sample_order = []
         for i, batch in enumerate(it):
@@ -98,9 +100,20 @@ class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
                 self.assertEqual(by.shape, (2, 2))
             if use_sample_weight:
                 self.assertIsInstance(bsw, expected_class)
-            for i in range(by.shape[0]):
-                sample_order.append(by[i, 0])
+            for j in range(by.shape[0]):
+                sample_order.append(backend.convert_to_numpy(by[j, 0]))
         self.assertAllClose(sample_order, list(range(34)))
+
+    def test_empty_generator_raises_clear_error(self):
+        def generator():
+            if False:
+                yield
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "the generator must yield at least one batch",
+        ):
+            generator_data_adapter.GeneratorDataAdapter(generator())
 
     def test_with_different_shapes(self):
         def generator():
@@ -110,14 +123,14 @@ class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
 
         adapter = generator_data_adapter.GeneratorDataAdapter(generator())
 
-        if backend.backend() == "numpy":
-            it = adapter.get_numpy_iterator()
-        elif backend.backend() == "tensorflow":
+        if backend.backend() == "tensorflow":
             it = adapter.get_tf_dataset()
         elif backend.backend() == "jax":
             it = adapter.get_jax_iterator()
         elif backend.backend() == "torch":
             it = adapter.get_torch_dataloader()
+        else:
+            it = adapter.get_numpy_iterator()
 
         for i, batch in enumerate(it):
             self.assertEqual(len(batch), 2)
@@ -134,6 +147,29 @@ class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
                 self.assertEqual(bx.shape, (2, 6))
                 self.assertEqual(by.shape, (2, 2))
 
+    @pytest.mark.skipif(
+        backend.backend() != "tensorflow",
+        reason="tf.data.Dataset specific behavior",
+    )
+    def test_with_unexpected_shapes(self):
+        def generator():
+            yield np.ones([16, 4], "float32"), np.ones([16, 2], "float32")
+            yield np.ones([16, 5], "float32"), np.ones([16, 2], "float32")
+            yield np.ones([16, 6], "float32"), np.ones([16, 3], "float32")
+
+        adapter = generator_data_adapter.GeneratorDataAdapter(generator())
+
+        it = iter(adapter.get_tf_dataset())
+        next(it)
+        next(it)
+        # note that Tensorflow wraps the TypeError in an InvalidArgumentError.
+        with self.assertRaisesRegex(
+            tf.errors.InvalidArgumentError,
+            "TypeError:.* shape \\(16, 3\\).* shape \\(None, 2\\) was expected"
+            ".*first two batches",
+        ):
+            next(it)
+
     @parameterized.named_parameters(
         named_product(generator_type=["tf", "jax", "scipy"])
     )
@@ -141,7 +177,7 @@ class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
         not backend.SUPPORTS_SPARSE_TENSORS,
         reason="Backend does not support sparse tensors",
     )
-    def test_scipy_sparse_tensors(self, generator_type):
+    def test_sparse_tensors(self, generator_type):
         if generator_type == "tf":
             x = tf.SparseTensor([[0, 0], [1, 2]], [1.0, 2.0], (2, 4))
             y = tf.SparseTensor([[0, 0], [1, 1]], [3.0, 4.0], (2, 2))
@@ -172,3 +208,33 @@ class GeneratorDataAdapterTest(testing.TestCase, parameterized.TestCase):
             self.assertIsInstance(by, expected_class)
             self.assertEqual(bx.shape, (2, 4))
             self.assertEqual(by.shape, (2, 2))
+
+    @pytest.mark.skipif(
+        not backend.SUPPORTS_RAGGED_TENSORS,
+        reason="Backend does not support ragged tensors",
+    )
+    def test_ragged_tensors(self):
+        x = tf.ragged.constant(
+            [[[0.0, 1.0]], [[2.0, 3.0], [4.0, 5.0]]], ragged_rank=1
+        )
+        y = tf.ragged.constant(
+            [[[0.0, 1.0]], [[0.0, 1.0], [0.0, 1.0]]], ragged_rank=1
+        )
+
+        def generate():
+            for _ in range(4):
+                yield x, y
+
+        adapter = generator_data_adapter.GeneratorDataAdapter(generate())
+
+        if backend.backend() == "tensorflow":
+            it = adapter.get_tf_dataset()
+            expected_class = tf.RaggedTensor
+
+        for batch in it:
+            self.assertEqual(len(batch), 2)
+            bx, by = batch
+            self.assertIsInstance(bx, expected_class)
+            self.assertIsInstance(by, expected_class)
+            self.assertEqual(bx.shape, (2, None, 2))
+            self.assertEqual(by.shape, (2, None, 2))

@@ -2,6 +2,7 @@ from keras.src import backend
 from keras.src.api_export import keras_export
 from keras.src.layers.layer import Layer
 from keras.src.utils import backend_utils
+from keras.src.utils import numerical_utils
 from keras.src.utils import tf_utils
 from keras.src.utils.module_utils import tensorflow as tf
 
@@ -208,30 +209,45 @@ class Hashing(Layer):
         self._allow_non_tensor_positional_args = True
         self.supports_jit = False
 
+    def compute_output_shape(self, input_shape):
+        if self.output_mode == "int":
+            return tuple(input_shape)
+        # `one_hot`, `multi_hot` and `count` encode the last (sample) axis
+        # into a `num_bins`-sized axis.
+        if len(input_shape) == 0:
+            return (self.num_bins,)
+        return tuple(input_shape[:-1]) + (self.num_bins,)
+
     def call(self, inputs):
-        if not isinstance(
-            inputs, (tf.Tensor, tf.SparseTensor, tf.RaggedTensor)
-        ):
-            inputs = tf.convert_to_tensor(backend.convert_to_numpy(inputs))
-        if isinstance(inputs, tf.SparseTensor):
-            indices = tf.SparseTensor(
-                indices=inputs.indices,
-                values=self._hash_values_to_bins(inputs.values),
-                dense_shape=inputs.dense_shape,
+        from keras.src.backend import tensorflow as tf_backend
+
+        with tf.device("CPU:0"):
+            inputs = tf_utils.ensure_tensor(inputs)
+            if self.output_mode == "one_hot" and inputs.shape[-1] == 1:
+                inputs = tf_backend.numpy.squeeze(inputs, axis=-1)
+            if isinstance(inputs, tf.SparseTensor):
+                indices = tf.SparseTensor(
+                    indices=inputs.indices,
+                    values=self._hash_values_to_bins(inputs.values),
+                    dense_shape=inputs.dense_shape,
+                )
+            else:
+                indices = self._hash_values_to_bins(inputs)
+            outputs = numerical_utils.encode_categorical_inputs(
+                indices,
+                output_mode=self.output_mode,
+                depth=self.num_bins,
+                sparse=self.sparse,
+                dtype=self.dtype,
+                backend_module=tf_backend,
             )
-        else:
-            indices = self._hash_values_to_bins(inputs)
-        outputs = tf_utils.encode_categorical_inputs(
-            indices,
-            output_mode=self.output_mode,
-            depth=self.num_bins,
-            sparse=self.sparse,
-            dtype=self.dtype,
-        )
         return backend_utils.convert_tf_tensor(outputs)
 
     def _hash_values_to_bins(self, values):
-        """Converts a non-sparse tensor of values to bin indices."""
+        """Converts a non-sparse tensor of values to bin indices.
+        Must be called inside a `with tf.device("CPU:0")` context (as done
+        in `call`) since all TF string ops produce CPU-resident tensors.
+        """
         hash_bins = self.num_bins
         mask = None
         # If mask_value is set, the zeroth bin is reserved for it.

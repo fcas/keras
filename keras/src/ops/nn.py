@@ -6,13 +6,21 @@ from keras.src import backend
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
 from keras.src.backend import any_symbolic_tensors
+from keras.src.backend import config
 from keras.src.backend import standardize_data_format
+from keras.src.backend.common.backend_utils import canonicalize_axes
+from keras.src.backend.common.backend_utils import canonicalize_axis
+from keras.src.backend.common.backend_utils import check_conv_input_channels
+from keras.src.backend.common.backend_utils import (
+    check_conv_transpose_input_channels,
+)
 from keras.src.backend.common.backend_utils import (
     compute_conv_transpose_output_shape,
 )
 from keras.src.ops import operation_utils
 from keras.src.ops.operation import Operation
 from keras.src.ops.operation_utils import reduce_shape
+from keras.src.utils.python_utils import is_continuous_axis
 
 
 class Relu(Operation):
@@ -109,6 +117,42 @@ def sigmoid(x):
     return backend.nn.sigmoid(x)
 
 
+class SparseSigmoid(Operation):
+    def call(self, x):
+        return backend.nn.sparse_sigmoid(x)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.sparse_sigmoid", "keras.ops.nn.sparse_sigmoid"])
+def sparse_sigmoid(x):
+    """Sparse sigmoid activation function.
+
+    It is defined as
+
+    `f(x) = 0` for `x <= -1`,
+    `f(x) = 0.5 * (x + 1)` for `-1 < x < 1`,
+    `f(x) = 1` for `x >= 1`.
+
+    Args:
+        x: Input tensor.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = keras.ops.convert_to_tensor([-6.0, 1.0, 0.0, 1.0, 6.0])
+    >>> keras.ops.sparse_sigmoid(x)
+    array([0. , 1. , 0.5, 1. , 1. ], dtype=float32)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return SparseSigmoid().symbolic_call(x)
+    return backend.nn.sparse_sigmoid(x)
+
+
 class Softplus(Operation):
     def call(self, x):
         return backend.nn.softplus(x)
@@ -174,6 +218,86 @@ def softsign(x):
     return backend.nn.softsign(x)
 
 
+class SoftShrink(Operation):
+    def __init__(self, threshold=0.5, *, name=None):
+        super().__init__(name=name)
+        self.threshold = threshold
+
+    def call(self, x):
+        return backend.nn.soft_shrink(x, self.threshold)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.soft_shrink", "keras.ops.nn.soft_shrink"])
+def soft_shrink(x, threshold=0.5):
+    """Soft Shrink activation function.
+
+    It is defined as
+
+    `f(x) = x - threshold` if `x > threshold`,
+    `f(x) = x + threshold` if `x < -threshold`,
+    `f(x) = 0` otherwise.
+
+    Args:
+        x: Input tensor.
+        threshold: Threshold value. Defaults to 0.5.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-1.0, 0.0, 1.0])
+    >>> x_soft_shrink = keras.ops.soft_shrink(x)
+    >>> print(x_soft_shrink)
+    array([-0.5  0.   0.5], shape=(3,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return SoftShrink(threshold).symbolic_call(x)
+    return backend.nn.soft_shrink(x, threshold)
+
+
+class SparsePlus(Operation):
+    def call(self, x):
+        return backend.nn.sparse_plus(x)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.sparse_plus", "keras.ops.nn.sparse_plus"])
+def sparse_plus(x):
+    """SparsePlus activation function.
+
+    It is defined as
+
+    `f(x) = 0` for `x <= -1`.
+    `f(x) = (1/4) * (x + 1)^2` for `-1 < x < 1`.
+    `f(x) = x` for `x >= 1`.
+
+
+    Args:
+        x: Input tensor.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-1.0, 0.0, 1.0])
+    >>> x_sparse_plus = keras.ops.sparse_plus(x)
+    >>> print(x_sparse_plus)
+    Array([0.   0.25 1.  ], shape=(3,), dtype=float32)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return SparsePlus().symbolic_call(x)
+    return backend.nn.sparse_plus(x)
+
+
 class Silu(Operation):
     def call(self, x):
         return backend.nn.silu(x)
@@ -216,6 +340,57 @@ def silu(x):
     return backend.nn.silu(x)
 
 
+class Squareplus(Operation):
+    def __init__(self, b=4, *, name=None):
+        super().__init__(name=name)
+        self.b = b
+
+    def call(self, x):
+        return _squareplus(x, self.b)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.squareplus", "keras.ops.nn.squareplus"])
+def squareplus(x, b=4):
+    """Squareplus activation function.
+
+    The Squareplus activation function is defined as:
+
+    `f(x) = (x + sqrt(x^2 + b)) / 2`
+
+    Args:
+        x: Input tensor.
+        b: Smoothness parameter. Defaults to 4.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-1.0, 0.0, 1.0])
+    >>> x_squareplus = keras.ops.squareplus(x)
+    >>> print(x_squareplus)
+    array([0.6180, 1.0000, 1.6180], dtype=float32)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return Squareplus(b).symbolic_call(x)
+    return _squareplus(x, b)
+
+
+def _squareplus(x, b):
+    if not config._use_backend_agnostic_ops() and hasattr(
+        backend.nn, "squareplus"
+    ):
+        return backend.nn.squareplus(x, b)
+    x = backend.convert_to_tensor(x)
+    b = backend.convert_to_tensor(b, dtype=x.dtype)
+    y = (x + backend.numpy.sqrt(backend.numpy.square(x) + b)) / 2.0
+    return backend.cast(y, dtype=x.dtype)
+
+
 class LogSigmoid(Operation):
     def call(self, x):
         return backend.nn.log_sigmoid(x)
@@ -254,8 +429,8 @@ def log_sigmoid(x):
 
 
 class LeakyRelu(Operation):
-    def __init__(self, negative_slope=0.2):
-        super().__init__()
+    def __init__(self, negative_slope=0.2, *, name=None):
+        super().__init__(name=name)
         self.negative_slope = negative_slope
 
     def call(self, x):
@@ -380,8 +555,8 @@ def hard_silu(x):
 
 
 class Elu(Operation):
-    def __init__(self, alpha=1.0):
-        super().__init__()
+    def __init__(self, alpha=1.0, *, name=None):
+        super().__init__(name=name)
         self.alpha = alpha
 
     def call(self, x):
@@ -456,8 +631,8 @@ def selu(x):
 
 
 class Gelu(Operation):
-    def __init__(self, approximate=True):
-        super().__init__()
+    def __init__(self, approximate=True, *, name=None):
+        super().__init__(name=name)
         self.approximate = approximate
 
     def call(self, x):
@@ -498,15 +673,262 @@ def gelu(x, approximate=True):
     return backend.nn.gelu(x, approximate)
 
 
+class Celu(Operation):
+    def __init__(self, alpha=1.0, *, name=None):
+        super().__init__(name=name)
+        self.alpha = alpha
+
+    def call(self, x):
+        return backend.nn.celu(x, self.alpha)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.celu", "keras.ops.nn.celu"])
+def celu(x, alpha=1.0):
+    """Continuously-differentiable exponential linear unit.
+
+    It is defined as:
+
+    `f(x) =  alpha * (exp(x / alpha) - 1) for x < 0`, `f(x) = x for x >= 0`.
+
+    Args:
+        x: Input tensor.
+        alpha: the α value for the CELU formulation. Defaults to `1.0`.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-1., 0., 1.])
+    >>> x_celu = keras.ops.celu(x)
+    >>> print(x_celu)
+    array([-0.63212056, 0. , 1. ], shape=(3,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return Celu(alpha).symbolic_call(x)
+    return backend.nn.celu(x, alpha)
+
+
+class Glu(Operation):
+    def __init__(self, axis=-1, *, name=None):
+        super().__init__(name=name)
+        self.axis = axis
+
+    def call(self, x):
+        return backend.nn.glu(x, axis=self.axis)
+
+    def compute_output_spec(self, x):
+        output_shape = list(x.shape)
+        canonicalize_axis(self.axis, len(output_shape))
+        if output_shape[self.axis] is not None:
+            if output_shape[self.axis] % 2 != 0:
+                raise ValueError(
+                    "axis size must be divisible by 2. "
+                    f"Received: x.shape={x.shape} with axis={self.axis}"
+                )
+            output_shape[self.axis] = output_shape[self.axis] // 2
+        return KerasTensor(output_shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.glu", "keras.ops.nn.glu"])
+def glu(x, axis=-1):
+    """Gated Linear Unit (GLU) activation function.
+
+    It is defined as:
+
+    `f(x) = a * sigmoid(b)`
+    where `x` is split into `a` and `b` along the given axis.
+
+    Args:
+        x: Input tensor.
+        axis: The axis along which to split the input tensor. Defaults to `-1`.
+
+    Returns:
+        A tensor with the same shape as half of the input.
+
+    Example:
+
+    >>> x = np.array([-1., 0., 1. , 1.])
+    >>> x_glu = keras.ops.glu(x)
+    >>> print(x_glu)
+    array([-0.73105858, 0. ], shape=(2,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return Glu(axis).symbolic_call(x)
+    return backend.nn.glu(x, axis=axis)
+
+
+class TanhShrink(Operation):
+    def call(self, x):
+        return backend.nn.tanh_shrink(x)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.tanh_shrink", "keras.ops.nn.tanh_shrink"])
+def tanh_shrink(x):
+    """Applies the tanh shrink function element-wise.
+
+    It is defined as:
+
+    `f(x) = x - tanh(x)`.
+
+    Args:
+        x: Input tensor.
+
+    Returns:
+        Output tensor of the same shape as `x`, where each element is
+        transformed according to the tanh shrink operation.
+
+    Example:
+
+    >>> x = np.array([ -1., 0., 1.])
+    >>> x_tanh_shrink = keras.ops.tanh_shrink(x)
+    >>> print(x_tanh_shrink)
+    array([-0.23840584  0.  0.23840584], shape=(3,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return TanhShrink().symbolic_call(x)
+    return backend.nn.tanh_shrink(x)
+
+
+class HardTanh(Operation):
+    def call(self, x):
+        return backend.nn.hard_tanh(x)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.hard_tanh", "keras.ops.nn.hard_tanh"])
+def hard_tanh(x):
+    """Applies the HardTanh function element-wise.
+
+    It is defined as:
+
+    `f(x) = -1 for x < -1`, `f(x) = x for -1 <= x <= 1`, `f(x) = 1 for x > 1`.
+
+    Args:
+        x: Input tensor.
+
+    Returns:
+        Output tensor of same shape as `x`
+        where values are clamped between -1 and 1.
+
+    Example:
+
+    >>> x = np.array([-2., -1., 0., 1., 2.])
+    >>> x_hard_tanh = keras.ops.hard_tanh(x)
+    >>> print(x_hard_tanh)
+    array([-1. -1.  0.  1.  1.], shape=(5,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return HardTanh().symbolic_call(x)
+    return backend.nn.hard_tanh(x)
+
+
+class HardShrink(Operation):
+    def __init__(self, threshold=0.5, *, name=None):
+        super().__init__(name=name)
+        self.threshold = threshold
+
+    def call(self, x):
+        return backend.nn.hard_shrink(x, self.threshold)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.hard_shrink", "keras.ops.nn.hard_shrink"])
+def hard_shrink(x, threshold=0.5):
+    """Hard Shrink activation function.
+
+    The Hard Shrink function is a thresholding operation defined as:
+
+    `f(x) = x` if `|x| > threshold`,
+    `f(x) = 0` otherwise.
+
+    Args:
+        x: Input tensor.
+        threshold: Threshold value. Defaults to 0.5.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-0.5, 0., 1.])
+    >>> x_hard_shrink = keras.ops.hard_shrink(x)
+    >>> print(x_hard_shrink)
+    array([0. 0. 1.], shape=(3,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return HardShrink(threshold).symbolic_call(x)
+    return backend.nn.hard_shrink(x, threshold)
+
+
+class Threshold(Operation):
+    def __init__(self, threshold, default_value, *, name=None):
+        super().__init__(name=name)
+        self.threshold = threshold
+        self.default_value = default_value
+
+    def call(self, x):
+        return backend.nn.threshold(x, self.threshold, self.default_value)
+
+    def compute_output_spec(self, x):
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.threshold", "keras.ops.nn.threshold"])
+def threshold(x, threshold, default_value):
+    """Threshold activation function.
+
+    The function thresholds the input `x` as follows:
+    `f(x) = x` if `x > threshold`,
+    `f(x) = default_value` otherwise.
+
+    Args:
+        x: Input tensor.
+        threshold: The value that decides when to retain or replace x.
+        default_value: Value to assign when `x <= threshold`.
+
+    Returns:
+        A tensor with the same shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-1.0, 0.0, 1.0, 2.0])
+    >>> x_threshold = keras.ops.threshold(x, 1, 0)
+    >>> print(x_threshold)
+    array([0., 0., 0., 2.], shape=(4,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return Threshold(threshold, default_value).symbolic_call(x)
+    return backend.nn.threshold(x, threshold, default_value)
+
+
 class Softmax(Operation):
-    def __init__(self, axis=-1):
-        super().__init__()
+    def __init__(self, axis=-1, *, name=None):
+        super().__init__(name=name)
         self.axis = axis
 
     def call(self, x):
         return backend.nn.softmax(x, axis=self.axis)
 
     def compute_output_spec(self, x):
+        if self.axis is not None:
+            canonicalize_axes(self.axis, len(x.shape))
         return KerasTensor(x.shape, dtype=x.dtype)
 
 
@@ -541,7 +963,11 @@ def softmax(x, axis=-1):
     # Don't use `backend.shape` since TensorFlow returns
     # symbolic tensors for unknown shape which can trigger
     # an error in TensorFlow graph execution.
-    if isinstance(axis, int) and x.shape[axis] == 1:
+    if (
+        isinstance(axis, int)
+        and -len(x.shape) <= axis < len(x.shape)
+        and x.shape[axis] == 1
+    ):
         warnings.warn(
             f"You are using a softmax over axis {axis} "
             f"of a tensor of shape {x.shape}. This axis "
@@ -552,37 +978,37 @@ def softmax(x, axis=-1):
     if any_symbolic_tensors((x,)):
         return Softmax(axis).symbolic_call(x)
     if isinstance(axis, tuple):
-        original_shape = x.shape
-        new_shape = []
-        skip_dims = set(axis)
-        i = 0
-        while i < len(original_shape):
-            if i in skip_dims:
-                size = 1
-                while i in skip_dims:
-                    size *= original_shape[i]
-                    i += 1
-                new_shape.append(size)
-            else:
-                new_shape.append(original_shape[i])
-                i += 1
-        x = backend.numpy.reshape(x, new_shape)
-        x = backend.nn.softmax(x, axis=-1)
-        x = backend.numpy.reshape(x, original_shape)
+        axis_to_keep = [v for v in range(len(x.shape)) if v not in axis]
+
+        x_transposed = backend.numpy.transpose(x, axes=(*axis_to_keep, *axis))
+        x_reshaped = backend.numpy.reshape(
+            x_transposed, (*[x.shape[v] for v in axis_to_keep], -1)
+        )
+
+        x = backend.nn.softmax(x_reshaped, axis=-1)
+
+        x = backend.numpy.reshape(x, x_transposed.shape)
+        combined = [*axis_to_keep, *axis]
+        x = backend.numpy.transpose(
+            x,
+            axes=sorted(range(len(combined)), key=combined.__getitem__),
+        )
         return x
     else:
         return backend.nn.softmax(x, axis=axis)
 
 
 class LogSoftmax(Operation):
-    def __init__(self, axis=-1):
-        super().__init__()
+    def __init__(self, axis=-1, *, name=None):
+        super().__init__(name=name)
         self.axis = axis
 
     def call(self, x):
         return backend.nn.log_softmax(x, axis=self.axis)
 
     def compute_output_spec(self, x):
+        if self.axis is not None:
+            canonicalize_axes(self.axis, len(x.shape))
         return KerasTensor(x.shape, dtype=x.dtype)
 
 
@@ -617,26 +1043,67 @@ def log_softmax(x, axis=-1):
     if any_symbolic_tensors((x,)):
         return LogSoftmax(axis).symbolic_call(x)
     if isinstance(axis, tuple):
-        original_shape = x.shape
-        new_shape = []
-        skip_dims = set(axis)
-        i = 0
-        while i < len(original_shape):
-            if i in skip_dims:
-                size = 1
-                while i in skip_dims:
-                    size *= original_shape[i]
-                    i += 1
-                new_shape.append(size)
-            else:
-                new_shape.append(original_shape[i])
-                i += 1
-        x = backend.numpy.reshape(x, new_shape)
-        x = backend.nn.log_softmax(x, axis=-1)
-        x = backend.numpy.reshape(x, original_shape)
+        axis_to_keep = [v for v in range(len(x.shape)) if v not in axis]
+
+        x_transposed = backend.numpy.transpose(x, axes=(*axis_to_keep, *axis))
+        x_reshaped = backend.numpy.reshape(
+            x_transposed, (*[x.shape[v] for v in axis_to_keep], -1)
+        )
+
+        x = backend.nn.log_softmax(x_reshaped, axis=-1)
+
+        x = backend.numpy.reshape(x, x_transposed.shape)
+        combined = [*axis_to_keep, *axis]
+        x = backend.numpy.transpose(
+            x,
+            axes=sorted(range(len(combined)), key=combined.__getitem__),
+        )
         return x
     else:
         return backend.nn.log_softmax(x, axis=axis)
+
+
+class Sparsemax(Operation):
+    def __init__(self, axis=-1, *, name=None):
+        super().__init__(name=name)
+        self.axis = axis
+
+    def call(self, x):
+        return backend.nn.sparsemax(x, axis=self.axis)
+
+    def compute_output_spec(self, x):
+        canonicalize_axis(self.axis, len(x.shape))
+        return KerasTensor(x.shape, dtype=x.dtype)
+
+
+@keras_export(["keras.ops.sparsemax", "keras.ops.nn.sparsemax"])
+def sparsemax(x, axis=-1):
+    """Sparsemax activation function.
+
+    For each batch `i`, and class `j`,
+    sparsemax activation function is defined as:
+
+    `sparsemax(x)[i, j] = max(x[i, j] - τ(x[i, :]), 0).`
+
+    Args:
+        x: Input tensor.
+        axis: `int`, axis along which the sparsemax operation is applied.
+
+    Returns:
+        A tensor, output of sparsemax transformation. Has the same type and
+        shape as `x`.
+
+    Example:
+
+    >>> x = np.array([-1., 0., 1.])
+    >>> x_sparsemax = keras.ops.sparsemax(x)
+    >>> print(x_sparsemax)
+    array([0., 0., 1.], shape=(3,), dtype=float64)
+
+    """
+    if any_symbolic_tensors((x,)):
+        return Sparsemax(axis).symbolic_call(x)
+    return backend.nn.sparsemax(x, axis=axis)
 
 
 class MaxPool(Operation):
@@ -646,8 +1113,10 @@ class MaxPool(Operation):
         strides=None,
         padding="valid",
         data_format=None,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.pool_size = pool_size
         self.strides = strides
         self.padding = padding.lower()
@@ -725,6 +1194,87 @@ def max_pool(
     return backend.nn.max_pool(inputs, pool_size, strides, padding, data_format)
 
 
+class AdaptiveMaxPool(Operation):
+    """Adaptive max pooling operation."""
+
+    def __init__(self, output_size, data_format=None, *, name=None):
+        super().__init__(name=name)
+        self.output_size = output_size
+        self.data_format = data_format
+
+    def call(self, inputs):
+        return backend.nn.adaptive_max_pool(
+            inputs, output_size=self.output_size, data_format=self.data_format
+        )
+
+    def compute_output_spec(self, inputs):
+        if self.data_format == "channels_last":
+            spatial_dims = self.output_size
+            output_shape = (
+                inputs.shape[: -len(self.output_size)]
+                + spatial_dims
+                + (inputs.shape[-1],)
+            )
+        else:
+            spatial_dims = self.output_size
+            output_shape = (inputs.shape[0], inputs.shape[1]) + spatial_dims
+        return backend.KerasTensor(output_shape, dtype=inputs.dtype)
+
+
+@keras_export(["keras.ops.adaptive_max_pool", "keras.ops.nn.adaptive_max_pool"])
+def adaptive_max_pool(
+    inputs,
+    output_size,
+    data_format=None,
+):
+    """Adaptive max pooling operation.
+
+    Applies an adaptive max pooling operation that automatically computes the
+    kernel size and stride to pool the input to the specified `output_size`.
+    This operation is useful when you want a fixed output size regardless of
+    input size, commonly used in models like ResNet for global feature
+    extraction.
+    Args:
+        inputs: Tensor of rank 4. Input tensor of shape:
+            - If `data_format="channels_last"`:
+                `(batch_size, height, width, channels)`.
+            - If `data_format="channels_first"`:
+                `(batch_size, channels, height, width)`.
+        output_size: Integer or tuple/list of 2 integers, specifying the target
+            output spatial dimensions `(output_height, output_width)`. If a
+            single
+            integer is provided, the same value is used for both dimensions.
+        data_format: string, either `"channels_last"` or `"channels_first"`.
+            Defaults to the value found in your Keras config file at
+            `~/.keras/keras.json`. If never set, defaults to `"channels_last"`.
+
+    Returns:
+        A tensor of rank 4 representing the adaptive max pooled result.
+
+    Example:
+
+    >>> x = np.random.rand(2, 64, 64, 3)
+    >>> y = keras.ops.adaptive_max_pool(x, output_size=(32, 32))
+    >>> y.shape
+    (2, 32, 32, 3)
+
+    >>> # Works with any input size
+    >>> x = np.random.rand(2, 100, 80, 3)
+    >>> y = keras.ops.adaptive_max_pool(x, output_size=7)
+    >>> y.shape
+    (2, 7, 7, 3)
+    """
+    if data_format is None:
+        data_format = config.image_data_format()
+
+    if any_symbolic_tensors((inputs,)):
+        return AdaptiveMaxPool(output_size, data_format).symbolic_call(inputs)
+
+    return backend.nn.adaptive_max_pool(
+        inputs, output_size=output_size, data_format=data_format
+    )
+
+
 class AveragePool(Operation):
     def __init__(
         self,
@@ -732,8 +1282,10 @@ class AveragePool(Operation):
         strides=None,
         padding="valid",
         data_format=None,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.pool_size = pool_size
         self.strides = strides
         self.padding = padding.lower()
@@ -818,6 +1370,92 @@ def average_pool(
     )
 
 
+class AdaptiveAveragePool(Operation):
+    """Adaptive average pooling operation."""
+
+    def __init__(self, output_size, data_format=None, *, name=None):
+        super().__init__(name=name)
+        self.output_size = output_size
+        self.data_format = data_format
+
+    def call(self, inputs):
+        return backend.nn.adaptive_average_pool(
+            inputs, output_size=self.output_size, data_format=self.data_format
+        )
+
+    def compute_output_spec(self, inputs):
+        if self.data_format == "channels_last":
+            spatial_dims = self.output_size
+            output_shape = (
+                inputs.shape[: -len(self.output_size)]
+                + spatial_dims
+                + (inputs.shape[-1],)
+            )
+        else:
+            spatial_dims = self.output_size
+            output_shape = (inputs.shape[0], inputs.shape[1]) + spatial_dims
+        return backend.KerasTensor(output_shape, dtype=inputs.dtype)
+
+
+@keras_export(
+    ["keras.ops.adaptive_average_pool", "keras.ops.nn.adaptive_average_pool"]
+)
+def adaptive_average_pool(
+    inputs,
+    output_size,
+    data_format=None,
+):
+    """Adaptive average pooling operation.
+
+    Applies an adaptive average pooling operation that automatically
+    computes the kernel size and stride to pool the input to the
+    specified `output_size`. This operation is useful when you want a
+    fixed output size regardless of input size, commonly used in models
+    like ResNet for global feature extraction.
+
+    Args:
+        inputs: Tensor of rank 4. Input tensor of shape:
+            - If `data_format="channels_last"`:
+                `(batch_size, height, width, channels)`.
+            - If `data_format="channels_first"`:
+                `(batch_size, channels, height, width)`.
+        output_size: Integer or tuple/list of 2 integers, specifying the target
+            output spatial dimensions `(output_height, output_width)`. If a
+            single
+            integer is provided, the same value is used for both dimensions.
+        data_format: string, either `"channels_last"` or `"channels_first"`.
+            Defaults to the value found in your Keras config file at
+            `~/.keras/keras.json`. If never set, defaults to `"channels_last"`.
+
+    Returns:
+        A tensor of rank 4 representing the adaptive average pooled result.
+
+    Example:
+
+    >>> x = np.random.rand(2, 64, 64, 3)
+    >>> y = keras.ops.adaptive_average_pool(x, output_size=(32, 32))
+    >>> y.shape
+    (2, 32, 32, 3)
+
+    >>> # Works with any input size
+    >>> x = np.random.rand(2, 100, 80, 3)
+    >>> y = keras.ops.adaptive_average_pool(x, output_size=7)
+    >>> y.shape
+    (2, 7, 7, 3)
+    """
+    if data_format is None:
+        data_format = config.image_data_format()
+
+    if any_symbolic_tensors((inputs,)):
+        return AdaptiveAveragePool(output_size, data_format).symbolic_call(
+            inputs
+        )
+
+    return backend.nn.adaptive_average_pool(
+        inputs, output_size=output_size, data_format=data_format
+    )
+
+
 class Conv(Operation):
     def __init__(
         self,
@@ -825,8 +1463,10 @@ class Conv(Operation):
         padding="valid",
         data_format=None,
         dilation_rate=1,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.strides = strides
         self.padding = padding.lower()
         self.data_format = data_format
@@ -843,13 +1483,15 @@ class Conv(Operation):
         )
 
     def compute_output_spec(self, inputs, kernel):
+        data_format = standardize_data_format(self.data_format)
+        check_conv_input_channels(inputs, kernel, data_format)
         output_shape = operation_utils.compute_conv_output_shape(
             inputs.shape,
             kernel.shape[-1],
             kernel.shape[:-2],
             self.strides,
             self.padding,
-            self.data_format,
+            data_format,
             self.dilation_rate,
         )
         return KerasTensor(output_shape, dtype=inputs.dtype)
@@ -918,8 +1560,10 @@ class DepthwiseConv(Operation):
         padding="valid",
         data_format=None,
         dilation_rate=1,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.strides = strides
         self.padding = padding.lower()
         self.data_format = data_format
@@ -936,13 +1580,15 @@ class DepthwiseConv(Operation):
         )
 
     def compute_output_spec(self, inputs, kernel):
+        data_format = standardize_data_format(self.data_format)
+        check_conv_input_channels(inputs, kernel, data_format)
         output_shape = operation_utils.compute_conv_output_shape(
             inputs.shape,
             kernel.shape[-1] * kernel.shape[-2],
             kernel.shape[:-2],
             self.strides,
             self.padding,
-            self.data_format,
+            data_format,
             self.dilation_rate,
         )
         return KerasTensor(output_shape, dtype=inputs.dtype)
@@ -1000,7 +1646,7 @@ def depthwise_conv(
     """
     data_format = standardize_data_format(data_format)
     padding = padding.lower()
-    if any_symbolic_tensors((inputs,)):
+    if any_symbolic_tensors((inputs, kernel)):
         return DepthwiseConv(
             strides, padding, data_format, dilation_rate
         ).symbolic_call(inputs, kernel)
@@ -1021,8 +1667,10 @@ class SeparableConv(Operation):
         padding="valid",
         data_format=None,
         dilation_rate=1,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.strides = strides
         self.padding = padding.lower()
         self.data_format = data_format
@@ -1040,17 +1688,19 @@ class SeparableConv(Operation):
         )
 
     def compute_output_spec(self, inputs, depthwise_kernel, pointwise_kernel):
+        data_format = standardize_data_format(self.data_format)
+        check_conv_input_channels(inputs, depthwise_kernel, data_format)
         output_shape = list(
             depthwise_conv(
                 inputs,
                 depthwise_kernel,
                 self.strides,
                 self.padding,
-                self.data_format,
+                data_format,
                 self.dilation_rate,
             ).shape
         )
-        if self.data_format == "channels_last":
+        if data_format == "channels_last":
             output_shape[-1] = pointwise_kernel.shape[-1]
         else:
             output_shape[1] = pointwise_kernel.shape[-1]
@@ -1135,13 +1785,15 @@ def separable_conv(
 class ConvTranspose(Operation):
     def __init__(
         self,
-        strides,
+        strides=1,
         padding="valid",
         output_padding=None,
         data_format=None,
         dilation_rate=1,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.strides = strides
         self.output_padding = output_padding
         self.padding = padding.lower()
@@ -1164,6 +1816,8 @@ class ConvTranspose(Operation):
         )
 
     def compute_output_spec(self, inputs, kernel):
+        data_format = standardize_data_format(self.data_format)
+        check_conv_transpose_input_channels(inputs, kernel, data_format)
         kernel_size = kernel.shape[:-2]
         filters = kernel.shape[-2]
         output_shape = compute_conv_transpose_output_shape(
@@ -1173,7 +1827,7 @@ class ConvTranspose(Operation):
             self.strides,
             self.padding,
             self.output_padding,
-            self.data_format,
+            data_format,
             self.dilation_rate,
         )
         return KerasTensor(output_shape, dtype=inputs.dtype)
@@ -1188,7 +1842,7 @@ class ConvTranspose(Operation):
 def conv_transpose(
     inputs,
     kernel,
-    strides,
+    strides=1,
     padding="valid",
     output_padding=None,
     data_format=None,
@@ -1255,11 +1909,13 @@ def conv_transpose(
 
 
 class OneHot(Operation):
-    def __init__(self, num_classes, axis=-1, dtype=None, sparse=False):
-        super().__init__()
+    def __init__(
+        self, num_classes, axis=-1, dtype=None, sparse=False, *, name=None
+    ):
+        super().__init__(name=name)
         self.num_classes = num_classes
         self.axis = axis
-        self.dtype = dtype or backend.floatx()
+        self.dtype = dtype
         self.sparse = sparse
 
     def call(self, x):
@@ -1298,8 +1954,8 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
         x: Integer tensor to be encoded. The shape can be
             arbitrary, but the dtype should be integer.
         num_classes: Number of classes for the one-hot encoding.
-        axis: Axis along which the encoding is performed. Defaults to
-            `-1`, which represents the last axis.
+        axis: Axis along which the encoding is performed.
+            `-1` represents the last axis. Defaults to `-1`.
         dtype: (Optional) Data type of the output tensor. If not
             provided, it defaults to the default data type of the backend.
         sparse: Whether to return a sparse tensor; for backends that support
@@ -1320,6 +1976,7 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
            [0. 0. 1. 0.]
            [1. 0. 0. 0.]], shape=(4, 4), dtype=float32)
     """
+    dtype = backend.standardize_dtype(dtype)
     if any_symbolic_tensors((x,)):
         return OneHot(
             num_classes, axis=axis, dtype=dtype, sparse=sparse
@@ -1334,8 +1991,8 @@ def one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
 
 
 class BinaryCrossentropy(Operation):
-    def __init__(self, from_logits=False):
-        super().__init__()
+    def __init__(self, from_logits=False, *, name=None):
+        super().__init__(name=name)
         self.from_logits = from_logits
 
     def call(self, target, output):
@@ -1377,7 +2034,7 @@ def binary_crossentropy(target, output, from_logits=False):
             probabilities.
             Set it to `True` if `output` represents logits; otherwise,
             set it to `False` if `output` represents probabilities.
-            Defaults to`False`.
+            Defaults to `False`.
 
     Returns:
         Integer tensor: The computed binary cross-entropy loss between
@@ -1401,8 +2058,8 @@ def binary_crossentropy(target, output, from_logits=False):
 
 
 class CategoricalCrossentropy(Operation):
-    def __init__(self, from_logits=False, axis=-1):
-        super().__init__()
+    def __init__(self, from_logits=False, axis=-1, *, name=None):
+        super().__init__(name=name)
         self.from_logits = from_logits
         self.axis = axis
 
@@ -1452,7 +2109,7 @@ def categorical_crossentropy(target, output, from_logits=False, axis=-1):
             probabilities.
             Set it to `True` if `output` represents logits; otherwise,
             set it to `False` if `output` represents probabilities.
-            Defaults to`False`.
+            Defaults to `False`.
         axis: (optional) The axis along which the categorical cross-entropy
             is computed.
             Defaults to `-1`, which corresponds to the last dimension of
@@ -1485,8 +2142,8 @@ def categorical_crossentropy(target, output, from_logits=False, axis=-1):
 
 
 class SparseCategoricalCrossentropy(Operation):
-    def __init__(self, from_logits=False, axis=-1):
-        super().__init__()
+    def __init__(self, from_logits=False, axis=-1, *, name=None):
+        super().__init__(name=name)
         self.from_logits = from_logits
         self.axis = axis
 
@@ -1502,16 +2159,20 @@ class SparseCategoricalCrossentropy(Operation):
                 "Received: "
                 f"output.shape={output.shape}"
             )
+        axis = canonicalize_axis(self.axis, len(output.shape))
         target_shape = target.shape
         if len(target_shape) == len(output.shape) and target_shape[-1] == 1:
             target_shape = target_shape[:-1]
-        if target_shape != output.shape[:-1]:
+        output_shape_without_class = (
+            output.shape[:axis] + output.shape[axis + 1 :]
+        )
+        if target_shape != output_shape_without_class:
             raise ValueError(
                 "Arguments `target` and `output` must have the same shape "
                 "up until the last dimension: "
                 f"target.shape={target.shape}, output.shape={output.shape}"
             )
-        return KerasTensor(output.shape[:-1], dtype=output.dtype)
+        return KerasTensor(output_shape_without_class, dtype=output.dtype)
 
 
 @keras_export(
@@ -1540,7 +2201,7 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
             or probabilities.
             Set it to `True` if `output` represents logits; otherwise,
             set it to `False` if `output` represents probabilities.
-            Defaults to`False`.
+            Defaults to `False`.
         axis: (optional) The axis along which the sparse categorical
             cross-entropy is computed.
             Defaults to `-1`, which corresponds to the last dimension
@@ -1571,13 +2232,20 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
 
 class MultiHot(Operation):
     def __init__(
-        self, num_classes=None, axis=-1, dtype=None, sparse=False, **kwargs
+        self,
+        num_classes=None,
+        axis=-1,
+        dtype=None,
+        sparse=False,
+        *,
+        name=None,
+        **kwargs,
     ):
         if num_classes is None and "num_tokens" in kwargs:
             num_classes = kwargs.pop("num_tokens")
         if num_classes is None:
             raise ValueError("Argument `num_classes` must be specified.")
-        super().__init__(**kwargs)
+        super().__init__(name=name)
         self.num_classes = num_classes
         self.axis = axis
         self.dtype = dtype or backend.floatx()
@@ -1650,6 +2318,7 @@ def multi_hot(
     if num_classes is None:
         raise ValueError("Argument `num_classes` must be specified.")
 
+    dtype = backend.standardize_dtype(dtype)
     if any_symbolic_tensors((inputs,)):
         return MultiHot(num_classes, axis, dtype, sparse).symbolic_call(inputs)
 
@@ -1657,8 +2326,8 @@ def multi_hot(
 
 
 class Moments(Operation):
-    def __init__(self, axes, keepdims=False, synchronized=False):
-        super().__init__()
+    def __init__(self, axes, keepdims=False, synchronized=False, *, name=None):
+        super().__init__(name=name)
         self.axes = axes
         self.keepdims = keepdims
         self.synchronized = synchronized
@@ -1727,10 +2396,21 @@ def moments(x, axes, keepdims=False, synchronized=False):
 
 
 class BatchNorm(Operation):
-    def __init__(self, axis, epsilon):
-        super().__init__()
+    def __init__(self, axis, epsilon=1e-3, *, name=None):
+        super().__init__(name=name)
         self.axis = axis
         self.epsilon = epsilon
+
+    def call(self, x, mean, variance, offset=None, scale=None):
+        return backend.nn.batch_normalization(
+            x,
+            mean,
+            variance,
+            axis=self.axis,
+            offset=offset,
+            scale=scale,
+            epsilon=self.epsilon,
+        )
 
     def _check_shape(self, name, shape, expected_shape):
         if shape != expected_shape:
@@ -1811,8 +2491,8 @@ def batch_normalization(
 
 
 class CTCLoss(Operation):
-    def __init__(self, mask_index=0):
-        super().__init__()
+    def __init__(self, mask_index=0, *, name=None):
+        super().__init__(name=name)
         self.mask_index = mask_index
 
     def call(self, target, output, target_length, output_length):
@@ -1881,8 +2561,10 @@ class CTCDecode(Operation):
         top_paths=1,
         merge_repeated=True,
         mask_index=0,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.strategy = strategy
         self.beam_width = beam_width
         self.top_paths = top_paths
@@ -1953,7 +2635,7 @@ def ctc_decode(
         A tuple containing:
         - The tensor representing the list of decoded sequences. If
             `strategy="greedy"`, the shape is `(1, batch_size, max_length)`. If
-            `strategy="beam_seatch"`, the shape is
+            `strategy="beam_search"`, the shape is
             `(top_paths, batch_size, max_length)`. Note that: `-1` indicates the
             blank label.
         - If `strategy="greedy"`, a tensor of shape `(batch_size, 1)`
@@ -1983,16 +2665,21 @@ def ctc_decode(
 
 
 class Normalize(Operation):
-    def __init__(self, axis=-1, order=2):
-        super().__init__()
+    def __init__(self, axis=-1, order=2, epsilon=None, *, name=None):
+        super().__init__(name=name)
         self.axis = axis
         self.order = order
+        self.epsilon = epsilon
 
     def compute_output_spec(self, x):
+        if self.axis is not None:
+            canonicalize_axes(self.axis, len(x.shape))
         return KerasTensor(shape=x.shape)
 
     def call(self, x):
-        return _normalize(x, axis=self.axis, order=self.order)
+        return _normalize(
+            x, axis=self.axis, order=self.order, epsilon=self.epsilon
+        )
 
 
 @keras_export(
@@ -2001,7 +2688,7 @@ class Normalize(Operation):
         "keras.ops.nn.normalize",
     ]
 )
-def normalize(x, axis=-1, order=2):
+def normalize(x, axis=-1, order=2, epsilon=None):
     """Normalizes `x` over the specified axis.
 
     It is defined as: `normalize(x) = x / max(norm(x), epsilon)`.
@@ -2012,6 +2699,8 @@ def normalize(x, axis=-1, order=2):
             Default to -1.
         order: The exponent value in the norm formulation.
             Defaults to 2.
+        epsilon: A lower bound value for the norm.
+            Defaults to `backend.epsilon()`.
 
     Returns:
         The normalized array.
@@ -2026,11 +2715,13 @@ def normalize(x, axis=-1, order=2):
 
     """
     if any_symbolic_tensors((x,)):
-        return Normalize(axis=axis, order=order).symbolic_call(x)
-    return _normalize(x, axis=axis, order=order)
+        return Normalize(axis=axis, order=order, epsilon=epsilon).symbolic_call(
+            x
+        )
+    return _normalize(x, axis=axis, order=order, epsilon=epsilon)
 
 
-def _normalize(x, axis=-1, order=2):
+def _normalize(x, axis=-1, order=2, epsilon=None):
     if not isinstance(order, int) or not order >= 1:
         raise ValueError(
             f"Argument `order` must be an int >= 1. Received: order={order}"
@@ -2038,7 +2729,19 @@ def _normalize(x, axis=-1, order=2):
     x = backend.convert_to_tensor(x)
     if len(x.shape) == 0:
         x = backend.numpy.expand_dims(x, axis=0)
-    epsilon = backend.epsilon()
+    if epsilon is None:
+        epsilon = backend.epsilon()
+    if 2 == order:
+        # A special case: L2 normalization with `x * rsqrt(...)`
+        # instead of `x / sqrt(...)`. Clamp the squared norm before the
+        # rsqrt so zero vectors get a finite gradient.
+        square_sum = backend.numpy.sum(
+            backend.numpy.square(x), axis=axis, keepdims=True
+        )
+        inv_norm = backend.math.rsqrt(
+            backend.numpy.maximum(square_sum, epsilon * epsilon)
+        )
+        return x * inv_norm
     norm = backend.linalg.norm(x, ord=order, axis=axis, keepdims=True)
     denom = backend.numpy.maximum(norm, epsilon)
     return backend.numpy.divide(x, denom)
@@ -2048,8 +2751,10 @@ class PSNR(Operation):
     def __init__(
         self,
         max_val,
+        *,
+        name=None,
     ):
-        super().__init__()
+        super().__init__(name=name)
         self.max_val = max_val
 
     def call(self, x1, x2):
@@ -2115,3 +2820,857 @@ def psnr(
         x2,
         max_val,
     )
+
+
+class DotProductAttention(Operation):
+    def __init__(
+        self,
+        is_causal=False,
+        flash_attention=None,
+        attn_logits_soft_cap=None,
+        *,
+        name=None,
+    ):
+        super().__init__(name=name)
+        self.is_causal = is_causal
+        self.flash_attention = flash_attention
+        self.attn_logits_soft_cap = attn_logits_soft_cap
+
+    def call(
+        self,
+        query,
+        key,
+        value,
+        bias=None,
+        mask=None,
+        scale=None,
+    ):
+        return backend.nn.dot_product_attention(
+            query,
+            key,
+            value,
+            bias=bias,
+            mask=mask,
+            scale=scale,
+            is_causal=self.is_causal,
+            flash_attention=self.flash_attention,
+            attn_logits_soft_cap=self.attn_logits_soft_cap,
+        )
+
+    def compute_output_spec(
+        self,
+        query,
+        key,
+        value,
+        bias=None,
+        mask=None,
+        scale=None,
+    ):
+        dtype = backend.result_type(query.dtype, key.dtype, value.dtype)
+        return KerasTensor(query.shape, dtype=dtype)
+
+
+@keras_export(
+    ["keras.ops.dot_product_attention", "keras.ops.nn.dot_product_attention"]
+)
+def dot_product_attention(
+    query,
+    key,
+    value,
+    bias=None,
+    mask=None,
+    scale=None,
+    is_causal=False,
+    flash_attention=None,
+    attn_logits_soft_cap=None,
+):
+    """Scaled dot product attention function.
+
+    Computes the attention function on Q (`query`), K (`key`), and V(`value`):
+    `attention(Q, K, V) = softmax(Q * K / sqrt(d)) * V`. If we define `logits`
+    as the output of `Q * K` and the `probs` as the output of `softmax`.
+
+    Throughout this function, we utilize the following notation to represent the
+    shape of array:
+    - B: batch size
+    - S: length of the key/value
+    - T: length of the query
+    - N: number of attention heads
+    - H: dimensions of each attention head
+    - K: number of key/value heads
+    - G: number of groups, which equals to `N // K`
+
+    Args:
+        query: The query array with the shape of `(B, T, N, H)`.
+        key: The key array with the shape of `(B, S, K, H)`. When `K` equals
+            `N`, multi-headed attention (MHA) is performed. Otherwise, grouped
+            query attention (GQA) is performed if `N` is a multiple of `K`. and
+            multi-query attention (MQA) is performed if `K==1` (a special case
+            of GQA).
+        value: The value array with the same shape of `key`.
+        bias: Optional bias array to be added to logits. The shape must be
+            broadcastable to `(B, N, T, S)`.
+        mask: Optional mask array used to filter out logits. It is a boolean
+            mask where `True` indicates the element should take part in
+            attention. For an additive mask, users should pass it to bias. The
+            shape must be broadcastable to `(B, N, T, S)`.
+        scale: Optional scale for the logits. If `None`, the scale will be set
+            to `1.0 / sqrt(H)`.
+        is_causal: Whether to apply causal mask.
+        flash_attention: Whether to use flash attention. If `None`, it will
+            attempt to use flash attention if the required conditions are met.
+            Typically, the inputs must be in float16 and bfloat16 dtype and the
+            input layout requirements may vary depending on the backend.
+        attn_logits_soft_cap: The value limit for maximum value of the
+            attention logits before the softmax function is applied. This is
+            only supported in JAX TPU backend. Defaults to None.
+
+    Returns:
+        An array of the attention output with the same shape of `query`.
+
+    Example:
+
+    >>> query = keras.random.normal((2, 4, 8, 16))
+    >>> key = keras.random.normal((2, 6, 8, 16))
+    >>> value = keras.random.normal((2, 6, 8, 16))
+    >>> keras.ops.nn.dot_product_attention(query, key, value).shape
+    (2, 4, 8, 16)
+    """
+    if attn_logits_soft_cap is not None:
+        if backend.backend() == "jax":
+            import jax
+
+            if jax.devices()[0].platform != "tpu":
+                raise ValueError(
+                    "attn_logits_soft_cap is only supported for JAX on TPU. "
+                    "Set attn_logits_soft_cap=None when not using JAX on TPU."
+                )
+        else:
+            raise ValueError(
+                "attn_logits_soft_cap is only supported for JAX on TPU. "
+                "Set attn_logits_soft_cap=None when not using JAX on TPU."
+            )
+
+    if any_symbolic_tensors((query, key, value)):
+        return DotProductAttention(
+            is_causal=is_causal,
+            flash_attention=flash_attention,
+            attn_logits_soft_cap=attn_logits_soft_cap,
+        ).symbolic_call(
+            query,
+            key,
+            value,
+            bias=bias,
+            mask=mask,
+            scale=scale,
+        )
+    return backend.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        bias=bias,
+        mask=mask,
+        scale=scale,
+        is_causal=is_causal,
+        flash_attention=flash_attention,
+        attn_logits_soft_cap=attn_logits_soft_cap,
+    )
+
+
+class RMSNorm(Operation):
+    def __init__(self, axis=-1, epsilon=None, *, name=None):
+        super().__init__(name=name)
+        self.axis = axis
+        self.epsilon = epsilon
+
+    def compute_output_spec(self, x, scale):
+        return KerasTensor(shape=x.shape, dtype=x.dtype)
+
+    def call(self, x, scale=None):
+        return _rms_normalization(
+            x, scale=scale, axis=self.axis, epsilon=self.epsilon
+        )
+
+
+@keras_export(
+    [
+        "keras.ops.rms_normalization",
+        "keras.ops.nn.rms_normalization",
+    ]
+)
+def rms_normalization(x, scale=None, axis=-1, epsilon=None):
+    """Performs Root Mean Square (RMS) normalization on `x`.
+
+    The Keras operation implements the operation as described in
+    [Root Mean Square Layer Normalization](https://arxiv.org/pdf/1910.07467)
+    by Biao Zhang et al.
+
+    The operation is different from LayerNormalization with RMS scaling.
+
+    It is defined as `rms_normalization(x) = x * rsqrt(mean(square(x))) * scale`
+
+    Args:
+        x: Input tensor.
+        scale: Optional scaling factor for the normalization.
+        axis: The axis or axes along which to perform normalization. Defaults
+            to `-1`.
+        epsilon: A lower bound value for the norm. Defaults to
+            `backend.epsilon()`.
+
+    Returns:
+        The normalized array.
+
+    Example:
+
+    >>> x = keras.random.normal((1, 10))
+    >>> keras.ops.rms_normalization(x)
+    array([[0.69384296, 0.94444374, 0.16551171, 0.05749961, 1.11008865,
+            0.52475186, 1.57686807, 1.69893307, 1.27292764, 0.30819128]])
+    """
+    if any_symbolic_tensors((x, scale)):
+        return RMSNorm(axis=axis, epsilon=epsilon).symbolic_call(x, scale=scale)
+    return _rms_normalization(x, scale=scale, axis=axis, epsilon=epsilon)
+
+
+def _rms_normalization(x, scale=None, axis=-1, epsilon=None):
+    if epsilon is None:
+        epsilon = backend.epsilon()
+    original_dtype = backend.standardize_dtype(x.dtype)
+    # Computes in at least float32 precision for stability in half precision
+    # training.
+    compute_dtype = backend.result_type(x.dtype, "float32")
+
+    x = backend.convert_to_tensor(x, dtype=compute_dtype)
+    if scale is not None:
+        scale = backend.convert_to_tensor(scale, x.dtype)
+
+    if isinstance(axis, (tuple, list)):
+        axis = sorted(axis)
+    if backend.backend() == "torch" and is_continuous_axis(axis):
+        import torch.nn.functional as F
+
+        if isinstance(axis, (tuple, list)):
+            normalized_shape = tuple(x.shape[dim] for dim in axis)
+        else:
+            normalized_shape = (x.shape[axis],)
+        outputs = F.rms_norm(x, normalized_shape, scale, epsilon)
+    else:
+        if len(x.shape) == 0:
+            x = backend.numpy.expand_dims(x, axis=0)
+        rrms = backend.math.rsqrt(
+            backend.numpy.mean(
+                backend.numpy.square(x), axis=axis, keepdims=True
+            )
+            + epsilon
+        )
+        outputs = backend.numpy.multiply(x, rrms)
+        if scale is not None:
+            outputs = backend.numpy.multiply(outputs, scale)
+    return backend.cast(outputs, original_dtype)
+
+
+class LayerNorm(Operation):
+    def __init__(self, axis=-1, epsilon=None, rms_scaling=False, *, name=None):
+        super().__init__(name=name)
+        self.axis = axis
+        self.epsilon = epsilon
+        self.rms_scaling = rms_scaling
+
+    def compute_output_spec(self, x, gamma, beta):
+        return KerasTensor(shape=x.shape, dtype=x.dtype)
+
+    def call(self, x, gamma=None, beta=None):
+        return _layer_normalization(
+            x,
+            gamma=gamma,
+            beta=beta,
+            axis=self.axis,
+            epsilon=self.epsilon,
+            rms_scaling=self.rms_scaling,
+        )
+
+
+@keras_export(
+    [
+        "keras.ops.layer_normalization",
+        "keras.ops.nn.layer_normalization",
+    ]
+)
+def layer_normalization(
+    x, gamma=None, beta=None, axis=-1, epsilon=None, **kwargs
+):
+    """Layer normalization layer (Ba et al., 2016).
+
+    Normalize the activations of the previous layer for each given example in a
+    batch independently, rather than across a batch like Batch Normalization.
+    i.e. applies a transformation that maintains the mean activation within each
+    example close to 0 and the activation standard deviation close to 1.
+
+    Args:
+        x: Input tensor.
+        gamma: Optional scaling factor for the normalization.
+        beta: Optional add offset for the normalized tensor.
+        axis: The axis or axes along which to perform normalization. Default to
+            `-1`.
+        epsilon: A lower bound value for the norm.
+            Defaults to `backend.epsilon()`.
+
+    Returns:
+        The normalized array.
+
+    Example:
+
+    >>> x = keras.ops.arange(5, dtype="float32")
+    >>> keras.ops.layer_normalization(x)
+    array([-1.4142135, -0.70710677, 0.0, 0.7071067, 1.4142135])
+    """
+    rms_scaling = kwargs.pop("rms_scaling", False)
+    if rms_scaling:
+        warnings.warn(
+            "You passed `rms_scaling=True`, which is deprecated. This argument "
+            "incorrectly scales the input by the variance, not the root mean "
+            "square. To correctly use RMS Normalization, please use "
+            "`keras.ops.rms_normalization` / `keras.ops.nn.rms_normalization` "
+            "instead."
+        )
+
+    if any_symbolic_tensors((x, gamma, beta)):
+        return LayerNorm(
+            axis=axis, epsilon=epsilon, rms_scaling=rms_scaling
+        ).symbolic_call(x, gamma, beta)
+    return _layer_normalization(
+        x,
+        gamma=gamma,
+        beta=beta,
+        axis=axis,
+        epsilon=epsilon,
+        rms_scaling=rms_scaling,
+    )
+
+
+def _layer_normalization(
+    x, gamma=None, beta=None, axis=-1, epsilon=None, rms_scaling=False
+):
+    if epsilon is None:
+        epsilon = backend.epsilon()
+    original_dtype = backend.standardize_dtype(x.dtype)
+    # Computes in at least float32 precision for stability in half precision
+    # training.
+    compute_dtype = backend.result_type(x.dtype, "float32")
+
+    x = backend.convert_to_tensor(x, dtype=compute_dtype)
+    if gamma is not None:
+        gamma = backend.convert_to_tensor(gamma, x.dtype)
+    if beta is not None:
+        beta = backend.convert_to_tensor(beta, x.dtype)
+
+    # Compute the axes along which to reduce the mean / variance
+    input_shape = x.shape
+    ndims = len(input_shape)
+
+    # Broadcasting only necessary for norm when the axis is not just
+    # the last dimension
+    broadcast_shape = [1] * ndims
+    if isinstance(axis, int):
+        axis = [axis]
+    axis = sorted(axis)
+    for dim in axis:
+        broadcast_shape[dim] = input_shape[dim]
+
+    def _broadcast(v):
+        if v is not None and len(v.shape) != ndims and axis != [ndims - 1]:
+            return backend.numpy.reshape(v, broadcast_shape)
+        return v
+
+    if rms_scaling:
+        variance = backend.numpy.var(x, axis=axis, keepdims=True)
+        inv = backend.math.rsqrt(variance + epsilon)
+        outputs = outputs = x * inv
+        if gamma is not None:
+            outputs = outputs * backend.cast(_broadcast(gamma), x.dtype)
+    elif backend.config.backend() == "torch" and is_continuous_axis(axis):
+        # when using torch backend,use kernel to improve performance
+        import torch.nn.functional as F
+
+        normalized_shape = tuple(input_shape[dim] for dim in axis)
+        outputs = F.layer_norm(x, normalized_shape, gamma, beta, epsilon)
+    else:
+        # Calculate the mean & variance along self.axis (layer activations).
+        mean, variance = moments(x, axes=axis, keepdims=True)
+        gamma, beta = _broadcast(gamma), _broadcast(beta)
+        inv = backend.math.rsqrt(variance + epsilon)
+        if gamma is not None:
+            inv = inv * gamma
+
+        res = -mean * inv
+        if beta is not None:
+            res = res + beta
+
+        outputs = x * inv + res
+    return backend.cast(outputs, original_dtype)
+
+
+class Polar(Operation):
+    def compute_output_spec(self, abs_, angle):
+        return KerasTensor(shape=abs_.shape)
+
+    def call(self, abs_, angle):
+        return _polar(abs_, angle)
+
+
+@keras_export(["keras.ops.polar", "keras.ops.nn.polar"])
+def polar(abs_, angle):
+    """Constructs a complex tensor whose elements are Cartesian
+    coordinates corresponding to the polar coordinates
+    with absolute value `abs` and angle `angle`.
+
+    The operation is numerically equivalent to `torch.polar()`.
+    It is not equivalent to `scipy.lingalg.polar()` which performs
+    Singular Value Decomposition.
+
+    Given the magnitude (`abs_`) and angle (`angle`), this function computes the
+    corresponding complex number in the form of `real + imaginary * 1j`, where:
+    - `real = abs_ * cos(angle)`
+    - `imaginary = abs_ * sin(angle)`
+
+    Args:
+        abs_: The magnitude (absolute value) of the complex number.
+        angle: The angle (in radians) of the complex number.
+
+    Returns:
+        A complex number (or array of complex numbers) with the same shape as
+        `abs_` and `angle`.
+
+    Example:
+
+    >>> abs_ = keras.random.normal((1, 2))
+    >>> angle = keras.random.normal((1, 2))
+    >>> keras.ops.nn.polar(abs_, angle).shape
+    (1, 2)
+    >>> keras.ops.nn.polar(abs_, angle)
+    Array([[0.63185346-0.59370506j, 0.48960376-0.31677645j]], dtype=complex64)
+    """
+    if any_symbolic_tensors((abs_, angle)):
+        return Polar().symbolic_call(abs_, angle)
+    return _polar(abs_, angle)
+
+
+def _polar(abs_, angle):
+    """Internal implementation of the polar function.
+
+    Args:
+        abs_: The magnitude (absolute value) of the complex number.
+        angle: The angle (in radians) of the complex number.
+
+    Returns:
+        A complex number (or array of complex numbers) with the same shape as
+        `abs_` and `angle`.
+    """
+    abs_ = backend.convert_to_tensor(abs_)
+    angle = backend.convert_to_tensor(angle)
+
+    real = abs_ * backend.numpy.cos(angle)
+    imaginary = abs_ * backend.numpy.sin(angle)
+
+    result = backend.math._get_complex_tensor_from_tuple((real, imaginary))
+
+    return result
+
+
+class Unfold(Operation):
+    def __init__(
+        self, kernel_size, dilation=1, padding=0, stride=1, *, name=None
+    ):
+        super().__init__(name=name)
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        self.padding = padding
+        self.stride = stride
+
+    def compute_output_spec(self, x):
+        N, C, H, W = x.shape
+
+        def _pair(x):
+            return (x, x) if isinstance(x, int) else x
+
+        kH, kW = _pair(self.kernel_size)
+        dH, dW = _pair(self.dilation)
+        pH, pW = _pair(self.padding)
+        sH, sW = _pair(self.stride)
+
+        def out_size(L, k, d, p, s):
+            return (L + 2 * p - d * (k - 1) - 1) // s + 1
+
+        outH = out_size(H, kH, dH, pH, sH)
+        outW = out_size(W, kW, dW, pW, sW)
+        return KerasTensor(shape=(N, C * kH * kW, outH * outW), dtype=x.dtype)
+
+    def call(self, x):
+        return _unfold(
+            x, self.kernel_size, self.dilation, self.padding, self.stride
+        )
+
+
+@keras_export(["keras.ops.unfold", "keras.ops.nn.unfold"])
+def unfold(x, kernel_size, dilation=1, padding=0, stride=1):
+    """Extract sliding local blocks from a 4-D input (batched image).
+
+    This operation is known as **im2col** when used with convolution.
+    It rearranges the image into overlapping or non-overlapping patches
+    and returns a tensor whose *depth* (last axis) contains the flattened
+    patches.
+
+    Args:
+        x: A 4-D tensor of shape `(N, C, H, W)` (**channels-first** format).
+        kernel_size: int or tuple of two ints, the size of the sliding window
+            `(kH, kW)`.  If a single int is given, it is used for both
+            dimensions.
+        dilation: int or tuple of two ints, the spacing between kernel points
+            (a.k.a. **dilation** or **atrous** convolution). Default: 1.
+        padding: int or tuple of two ints, the amount of zero-padding to apply
+            to both spatial dimensions. Default: 0.
+        stride: int or tuple of two ints, the step size of the sliding window.
+            Default: 1.
+
+    Returns:
+        A 3-D tensor of shape `(N, C * kH * kW, L)` where
+        `L = num_patches_H * num_patches_W` is the total number of patches
+        extracted.
+
+    Example:
+
+    >>> x = keras.ops.ones((1, 2, 4, 4))
+    >>> patches = keras.ops.unfold(x, kernel_size=2, stride=2)
+    >>> patches.shape
+    (1, 8, 4)
+
+    """
+    input_shape = x.shape
+    ndims = len(input_shape)
+    if ndims != 4:
+        raise ValueError(
+            f"Input must be a 4D tensor. Received: input.shape={input_shape}"
+        )
+    if any_symbolic_tensors((x,)):
+        return Unfold(kernel_size, dilation, padding, stride).symbolic_call(x)
+    return _unfold(x, kernel_size, dilation, padding, stride)
+
+
+def _unfold(x, kernel_size, dilation=1, padding=0, stride=1):
+    """Internal implementation of unfold."""
+    return backend.nn.unfold(
+        x,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        padding=padding,
+        stride=stride,
+    )
+
+
+class Fold(Operation):
+    def __init__(
+        self,
+        output_size,
+        kernel_size,
+        dilation=1,
+        padding=0,
+        stride=1,
+        *,
+        name=None,
+    ):
+        super().__init__(name=name)
+        self.output_size = output_size
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        self.padding = padding
+        self.stride = stride
+
+    def compute_output_spec(self, x):
+        N, CKK, L = x.shape
+
+        def _pair(v):
+            return (v, v) if isinstance(v, int) else v
+
+        kH, kW = _pair(self.kernel_size)
+        oH, oW = _pair(self.output_size)
+
+        if CKK is not None and CKK % (kH * kW) != 0:
+            raise ValueError(
+                f"The second dimension of the input ({CKK}) must be "
+                f"divisible by kernel_size product ({kH * kW})."
+            )
+
+        C = CKK // (kH * kW) if CKK is not None else None
+        return KerasTensor(shape=(N, C, oH, oW), dtype=x.dtype)
+
+    def call(self, x):
+        return backend.nn.fold(
+            x,
+            output_size=self.output_size,
+            kernel_size=self.kernel_size,
+            dilation=self.dilation,
+            padding=self.padding,
+            stride=self.stride,
+        )
+
+
+@keras_export(["keras.ops.fold", "keras.ops.nn.fold"])
+def fold(x, output_size, kernel_size, dilation=1, padding=0, stride=1):
+    """Combines an array of sliding local blocks into a large containing
+    tensor (reverses `unfold`).
+
+    This operation is known as **col2im** when used with convolution.
+    It takes a 3-D tensor of flattened patches and reconstructs a 4-D
+    image tensor by summing overlapping patches.
+
+    Args:
+        x: A 3-D tensor of shape `(N, C * kH * kW, L)` where `L` is
+            the total number of blocks.
+        output_size: int or tuple of two ints `(oH, oW)`, the spatial
+            shape of the output tensor.
+        kernel_size: int or tuple of two ints, the size of the sliding
+            window `(kH, kW)`.  If a single int is given, it is used
+            for both dimensions.
+        dilation: int or tuple of two ints, the spacing between kernel
+            points. Default: 1.
+        padding: int or tuple of two ints, the amount of zero-padding
+            that was applied to the input of `unfold`. Default: 0.
+        stride: int or tuple of two ints, the step size of the sliding
+            window. Default: 1.
+
+    Returns:
+        A 4-D tensor of shape `(N, C, oH, oW)`.
+
+    Example:
+
+    >>> x = keras.ops.ones((1, 2, 4, 4))
+    >>> patches = keras.ops.unfold(x, kernel_size=2, stride=2)
+    >>> patches.shape
+    (1, 8, 4)
+    >>> y = keras.ops.fold(patches, output_size=(4, 4),
+    ...     kernel_size=2, stride=2)
+    >>> y.shape
+    (1, 2, 4, 4)
+
+    """
+    input_shape = x.shape
+    ndims = len(input_shape)
+    if ndims != 3:
+        raise ValueError(
+            f"Input must be a 3D tensor. Received: input.shape={input_shape}"
+        )
+    if any_symbolic_tensors((x,)):
+        return Fold(
+            output_size, kernel_size, dilation, padding, stride
+        ).symbolic_call(x)
+    return backend.nn.fold(
+        x,
+        output_size=output_size,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        padding=padding,
+        stride=stride,
+    )
+
+
+class DepthToSpace(Operation):
+    def __init__(self, block_size, data_format="channels_last", *, name=None):
+        super().__init__(name=name)
+        self.block_size = block_size
+        self.data_format = standardize_data_format(data_format)
+
+    def compute_output_spec(self, x):
+        if len(x.shape) != 4:
+            raise ValueError(
+                "`depth_to_space` requires a 4D input tensor. "
+                f"Received: x.shape={x.shape}"
+            )
+        if self.data_format == "channels_last":
+            b, h, w, c = x.shape
+        else:
+            b, c, h, w = x.shape
+
+        if c is not None and c % (self.block_size**2) != 0:
+            raise ValueError(
+                f"The number of channels ({c}) must be divisible by "
+                f"block_size**2 ({self.block_size**2})."
+            )
+
+        new_c = c // (self.block_size**2) if c is not None else None
+        new_h = h * self.block_size if h is not None else None
+        new_w = w * self.block_size if w is not None else None
+
+        if self.data_format == "channels_last":
+            output_shape = (b, new_h, new_w, new_c)
+        else:
+            output_shape = (b, new_c, new_h, new_w)
+
+        return KerasTensor(output_shape, dtype=x.dtype)
+
+    def call(self, x):
+        return backend.nn.depth_to_space(
+            x, self.block_size, data_format=self.data_format
+        )
+
+
+@keras_export(["keras.ops.depth_to_space", "keras.ops.nn.depth_to_space"])
+def depth_to_space(x, block_size, data_format="channels_last"):
+    """Rearranges data from depth into blocks of spatial data.
+
+    This operation is useful for resizing the activations between convolutions
+    (but keeping all data), e.g., instead of pooling. It is also useful for
+    training purely convolutional models.
+
+    Also known as pixel shuffle, this operation rearranges elements in a tensor
+    of shape `(N, H, W, C * r^2)` to `(N, H * r, W * r, C)` where `r` is the
+    `block_size` for `data_format="channels_last"`, or from
+    `(N, C * r^2, H, W)` to `(N, C, H * r, W * r)` for
+    `data_format="channels_first"`.
+
+    This is the reverse transformation of `space_to_depth`.
+
+    Args:
+        x: Input tensor. Must be 4D.
+        block_size: An integer specifying the size of the spatial block.
+            The depth (number of channels) must be divisible by
+            `block_size ** 2`.
+        data_format: A string specifying the data format of the input tensor.
+            `"channels_last"` corresponds to inputs with shape
+            `(batch, height, width, channels)` while `"channels_first"`
+            corresponds to inputs with shape `(batch, channels, height, width)`.
+            Defaults to `"channels_last"`.
+
+    Returns:
+        A tensor with the same dtype as `x`, with shape
+        `(N, H * block_size, W * block_size, C // block_size ** 2)` for
+        `data_format="channels_last"` or
+        `(N, C // block_size ** 2, H * block_size, W * block_size)` for
+        `data_format="channels_first"`.
+
+    Example:
+
+    >>> x = keras.ops.reshape(keras.ops.arange(1 * 2 * 2 * 12), (1, 2, 2, 12))
+    >>> keras.ops.depth_to_space(x, block_size=2).shape
+    (1, 4, 4, 3)
+
+    >>> # channels_first example
+    >>> x = keras.ops.reshape(keras.ops.arange(1 * 12 * 2 * 2), (1, 12, 2, 2))
+    >>> keras.ops.depth_to_space(x, block_size=2,
+    ...                          data_format="channels_first").shape
+    (1, 3, 4, 4)
+    """
+    data_format = standardize_data_format(data_format)
+    if block_size < 2:
+        raise ValueError(
+            "`block_size` must be at least 2. "
+            f"Received: block_size={block_size}"
+        )
+    if any_symbolic_tensors((x,)):
+        return DepthToSpace(block_size, data_format=data_format).symbolic_call(
+            x
+        )
+    return backend.nn.depth_to_space(x, block_size, data_format=data_format)
+
+
+class SpaceToDepth(Operation):
+    def __init__(self, block_size, data_format="channels_last", *, name=None):
+        super().__init__(name=name)
+        self.block_size = block_size
+        self.data_format = standardize_data_format(data_format)
+
+    def compute_output_spec(self, x):
+        if len(x.shape) != 4:
+            raise ValueError(
+                "`space_to_depth` requires a 4D input tensor. "
+                f"Received: x.shape={x.shape}"
+            )
+        if self.data_format == "channels_last":
+            b, h, w, c = x.shape
+        else:
+            b, c, h, w = x.shape
+
+        if h is not None and h % self.block_size != 0:
+            raise ValueError(
+                f"Height ({h}) must be divisible by block_size "
+                f"({self.block_size})."
+            )
+        if w is not None and w % self.block_size != 0:
+            raise ValueError(
+                f"Width ({w}) must be divisible by block_size "
+                f"({self.block_size})."
+            )
+
+        new_c = c * (self.block_size**2) if c is not None else None
+        new_h = h // self.block_size if h is not None else None
+        new_w = w // self.block_size if w is not None else None
+
+        if self.data_format == "channels_last":
+            output_shape = (b, new_h, new_w, new_c)
+        else:
+            output_shape = (b, new_c, new_h, new_w)
+
+        return KerasTensor(output_shape, dtype=x.dtype)
+
+    def call(self, x):
+        return backend.nn.space_to_depth(
+            x, self.block_size, data_format=self.data_format
+        )
+
+
+@keras_export(["keras.ops.space_to_depth", "keras.ops.nn.space_to_depth"])
+def space_to_depth(x, block_size, data_format="channels_last"):
+    """Rearranges blocks of spatial data into depth.
+
+    This operation is useful for resizing the activations between convolutions
+    (but keeping all data). It is also useful for training purely convolutional
+    models.
+
+    This operation rearranges elements in a tensor of shape
+    `(N, H * block_size, W * block_size, C)` to a tensor of shape
+    `(N, H, W, C * block_size ** 2)` (for `data_format="channels_last"`)
+    or `(N, C, H * block_size, W * block_size)` to
+    `(N, C * block_size ** 2, H, W)` (for `data_format="channels_first"`).
+
+    This is the reverse transformation of `depth_to_space`.
+
+    Args:
+        x: Input tensor. Must be 4D.
+        block_size: An integer specifying the size of the spatial block.
+            The height and width of the input must be divisible by
+            `block_size`.
+        data_format: A string specifying the data format of the input tensor.
+            `"channels_last"` corresponds to inputs with shape
+            `(batch, height, width, channels)` while `"channels_first"`
+            corresponds to inputs with shape `(batch, channels, height, width)`.
+            Defaults to `"channels_last"`.
+
+    Returns:
+        A tensor with the same dtype as `x`, with shape
+        `(N, H // block_size, W // block_size, C * block_size ** 2)` for
+        `data_format="channels_last"` or
+        `(N, C * block_size ** 2, H // block_size, W // block_size)` for
+        `data_format="channels_first"`.
+
+    Example:
+
+    >>> x = keras.ops.reshape(keras.ops.arange(1 * 4 * 4 * 3), (1, 4, 4, 3))
+    >>> keras.ops.space_to_depth(x, block_size=2).shape
+    (1, 2, 2, 12)
+
+    >>> # channels_first example
+    >>> x = keras.ops.reshape(keras.ops.arange(1 * 3 * 4 * 4), (1, 3, 4, 4))
+    >>> keras.ops.space_to_depth(x, block_size=2,
+    ...                          data_format="channels_first").shape
+    (1, 12, 2, 2)
+    """
+    data_format = standardize_data_format(data_format)
+    if block_size < 2:
+        raise ValueError(
+            "`block_size` must be at least 2. "
+            f"Received: block_size={block_size}"
+        )
+    if any_symbolic_tensors((x,)):
+        return SpaceToDepth(block_size, data_format=data_format).symbolic_call(
+            x
+        )
+    return backend.nn.space_to_depth(x, block_size, data_format=data_format)

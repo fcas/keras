@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 from absl.testing import parameterized
 
 from keras.src import backend
@@ -8,7 +7,7 @@ from keras.src import ops
 from keras.src import testing
 
 
-class Cropping3DTest(testing.TestCase, parameterized.TestCase):
+class Cropping3DTest(testing.TestCase):
     @parameterized.product(
         (
             {"dim1_cropping": (1, 2), "dim1_expected": (1, 5)},  # both
@@ -30,7 +29,6 @@ class Cropping3DTest(testing.TestCase, parameterized.TestCase):
             {"data_format": "channels_last"},
         ),
     )
-    @pytest.mark.requires_trainable_backend
     def test_cropping_3d(
         self,
         dim1_cropping,
@@ -89,7 +87,6 @@ class Cropping3DTest(testing.TestCase, parameterized.TestCase):
             {"data_format": "channels_last"},
         ),
     )
-    @pytest.mark.requires_trainable_backend
     def test_cropping_3d_with_same_cropping(
         self, cropping, data_format, expected
     ):

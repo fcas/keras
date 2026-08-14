@@ -6,8 +6,18 @@ from keras.src.backend.common import dtypes
 from keras.src.backend.numpy.core import convert_to_tensor
 
 
-def cholesky(a):
-    return np.linalg.cholesky(a)
+def cholesky(a, upper=False):
+    return np.linalg.cholesky(a, upper=upper)
+
+
+def cholesky_inverse(a, upper=False):
+    identity = np.eye(a.shape[-1], dtype=a.dtype)
+    inv_chol = solve_triangular(a, identity, lower=not upper)
+    if upper:
+        a_inv = np.matmul(inv_chol, inv_chol.T)
+    else:
+        a_inv = np.matmul(inv_chol.T, inv_chol)
+    return a_inv
 
 
 def det(a):
@@ -86,3 +96,27 @@ def lstsq(a, b, rcond=None):
     a = convert_to_tensor(a)
     b = convert_to_tensor(b)
     return np.linalg.lstsq(a, b, rcond=rcond)[0]
+
+
+def matrix_rank(x, tol=None):
+    x = convert_to_tensor(x)
+    if x.ndim < 2:
+        raise ValueError(
+            "Expected input to have rank >= 2. "
+            f"Received input with shape {x.shape}."
+        )
+    return np.linalg.matrix_rank(x, tol=tol).astype("int32")
+
+
+def matrix_power(a, n):
+    a = convert_to_tensor(a)
+    return np.linalg.matrix_power(a, n)
+
+
+def pinv(x, rcond=None):
+    x = convert_to_tensor(x)
+    return np.linalg.pinv(x, rcond=rcond)
+
+
+def jvp(fun, primals, tangents, has_aux=False):
+    raise NotImplementedError("JVP is not supported by the Numpy backend.")

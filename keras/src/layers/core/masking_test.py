@@ -1,13 +1,14 @@
+import os
+
 import numpy as np
-import pytest
 
 from keras.src import layers
 from keras.src import models
 from keras.src import testing
+from keras.src.saving import load_model
 
 
 class MaskingTest(testing.TestCase):
-    @pytest.mark.requires_trainable_backend
     def test_masking_basics(self):
         self.run_layer_test(
             layers.Masking,
@@ -19,9 +20,9 @@ class MaskingTest(testing.TestCase):
             expected_num_seed_generators=0,
             expected_num_losses=0,
             supports_masking=True,
+            assert_built_after_instantiation=True,
         )
 
-    @pytest.mark.requires_trainable_backend
     def test_masking_correctness(self):
         x = np.array(
             [
@@ -45,7 +46,7 @@ class MaskingTest(testing.TestCase):
                 return input_shape
 
             def call(self, inputs, mask=None):
-                assert mask is not None
+                test_obj.assertIsNotNone(mask)
                 test_obj.assertAllClose(mask, expected_mask)
                 return inputs
 
@@ -56,3 +57,22 @@ class MaskingTest(testing.TestCase):
             ]
         )
         model(x)
+
+    def test_masking_with_tensor(self):
+        model = models.Sequential(
+            [
+                layers.Masking(mask_value=0.0),
+                layers.LSTM(1),
+            ]
+        )
+        x = np.array(
+            [
+                [[1.0, 2.0], [0.0, 0.0], [0.0, 0.0]],
+                [[2.0, 2.0], [2.0, 1.0], [0.0, 0.0]],
+            ]
+        )
+        model(x)
+        temp_filepath = os.path.join(self.get_temp_dir(), "model.keras")
+        model.save(temp_filepath)
+        reload_model = load_model(temp_filepath)
+        reload_model(x)

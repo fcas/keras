@@ -1,12 +1,10 @@
 import numpy as np
-import pytest
 
 from keras.src import testing
 from keras.src.layers.activations import leaky_relu
 
 
 class LeakyReLUTest(testing.TestCase):
-    @pytest.mark.requires_trainable_backend
     def test_leaky_relu(self):
         self.run_layer_test(
             leaky_relu.LeakyReLU,
@@ -15,6 +13,7 @@ class LeakyReLUTest(testing.TestCase):
             },
             input_shape=(2, 3, 4),
             supports_masking=True,
+            assert_built_after_instantiation=True,
         )
 
     def test_leaky_relu_correctness(self):

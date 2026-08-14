@@ -7,10 +7,10 @@ class Conv3D(BaseConv):
     """3D convolution layer.
 
     This layer creates a convolution kernel that is convolved with the layer
-    input over a single spatial (or temporal) dimension to produce a tensor of
-    outputs. If `use_bias` is True, a bias vector is created and added to the
-    outputs. Finally, if `activation` is not `None`, it is applied to the
-    outputs as well.
+    input over a 3D spatial (or temporal) dimension (width,height and depth) to
+    produce a tensor of outputs. If `use_bias` is True, a bias vector is created
+    and added to the outputs. Finally, if `activation` is not `None`, it is
+    applied to the outputs as well.
 
     Args:
         filters: int, the dimension of the output space (the number of filters
@@ -110,7 +110,7 @@ class Conv3D(BaseConv):
         activity_regularizer=None,
         kernel_constraint=None,
         bias_constraint=None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(
             rank=3,
@@ -130,5 +130,5 @@ class Conv3D(BaseConv):
             activity_regularizer=activity_regularizer,
             kernel_constraint=kernel_constraint,
             bias_constraint=bias_constraint,
-            **kwargs
+            **kwargs,
         )

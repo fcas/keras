@@ -12,20 +12,54 @@ from keras.src import backend
 from keras.src.api_export import keras_export
 from keras.src.backend.common import global_state
 from keras.src.saving import object_registration
+from keras.src.saving.keras_saveable import KerasSaveable
 from keras.src.utils import python_utils
 from keras.src.utils.module_utils import tensorflow as tf
 
 PLAIN_TYPES = (str, int, float, bool)
 
 # List of Keras modules with built-in string representations for Keras defaults
-BUILTIN_MODULES = (
-    "activations",
-    "constraints",
-    "initializers",
-    "losses",
-    "metrics",
-    "optimizers",
-    "regularizers",
+BUILTIN_MODULES = frozenset(
+    {
+        "activations",
+        "constraints",
+        "initializers",
+        "losses",
+        "metrics",
+        "optimizers",
+        "regularizers",
+    }
+)
+
+NON_MODELING_APIS = frozenset(
+    {
+        "keras.backend.clear_session",
+        "keras.config.enable_unsafe_deserialization",
+        "keras.models.load_model",
+        "keras.models.model_from_json",
+        "keras.models.save_model",
+        "keras.preprocessing.image_dataset_from_directory",
+        "keras.preprocessing.image.load_img",
+        "keras.preprocessing.image.save_img",
+        "keras.preprocessing.text_dataset_from_directory",
+        "keras.saving.deserialize_keras_object",
+        "keras.saving.load_model",
+        "keras.saving.load_weights",
+        "keras.saving.register_keras_serializable",
+        "keras.saving.save_model",
+        "keras.saving.save_weights",
+        "keras.saving.serialize_keras_object",
+        "keras.utils.audio_dataset_from_directory",
+        "keras.utils.clear_session",
+        "keras.utils.deserialize_keras_object",
+        "keras.utils.get_file",
+        "keras.utils.image_dataset_from_directory",
+        "keras.utils.load_img",
+        "keras.utils.register_keras_serializable",
+        "keras.utils.save_img",
+        "keras.utils.serialize_keras_object",
+        "keras.utils.text_dataset_from_directory",
+    }
 )
 
 
@@ -366,7 +400,7 @@ def _get_class_or_fn_config(obj):
     """Return the object's config depending on its type."""
     # Functions / lambdas:
     if isinstance(obj, types.FunctionType):
-        return obj.__name__
+        return object_registration.get_registered_name(obj)
     # All classes:
     if hasattr(obj, "get_config"):
         config = obj.get_config()
@@ -486,10 +520,14 @@ def deserialize_keras_object(
         config: Python dict describing the object.
         custom_objects: Python dict containing a mapping between custom
             object names the corresponding classes or functions.
-        safe_mode: Boolean, whether to disallow unsafe `lambda` deserialization.
-            When `safe_mode=False`, loading an object has the potential to
-            trigger arbitrary code execution. This argument is only
-            applicable to the Keras v3 model format. Defaults to `True`.
+        safe_mode: Boolean, defaults to False. If True, disables unsafe
+            lambda deserialization.
+
+            Note that safe_mode is designed to protect against code
+            serialized within the Keras model file being loaded. It does
+            not provide isolation from the local Python environment and
+            does not guard against modifications made outside of the
+            serialized file.
 
     Returns:
         The object described by the `config` dictionary.
@@ -599,7 +637,7 @@ def deserialize_keras_object(
         }
 
     class_name = config["class_name"]
-    inner_config = config["config"] or {}
+    inner_config = config["config"] if config["config"] is not None else {}
     custom_objects = custom_objects or {}
 
     # Special cases:
@@ -641,15 +679,22 @@ def deserialize_keras_object(
     if config["class_name"] == "__lambda__":
         if safe_mode:
             raise ValueError(
-                "Requested the deserialization of a `lambda` object. "
-                "This carries a potential risk of arbitrary code execution "
-                "and thus it is disallowed by default. If you trust the "
-                "source of the saved model, you can pass `safe_mode=False` to "
-                "the loading function in order to allow `lambda` loading, "
-                "or call `keras.config.enable_unsafe_deserialization()`."
+                "Requested the deserialization of a Python lambda. This "
+                "carries a potential risk of arbitrary code execution and thus "
+                "it is disallowed by default. If you trust the source of the "
+                "artifact, you can override this error by passing "
+                "`safe_mode=False` to the loading function, or calling "
+                "`keras.config.enable_unsafe_deserialization()."
             )
         return python_utils.func_load(inner_config["value"])
     if tf is not None and config["class_name"] == "__typespec__":
+        if not isinstance(inner_config, (tuple, list)):
+            raise TypeError(
+                "Expected 'config' to be a list or a tuple"
+                "for a __typespec__ class name,\n"
+                f"instead got {type(inner_config)}\n"
+                f"Full config: {config}"
+            )
         obj = _retrieve_class_or_fn(
             config["spec_name"],
             config["registered_name"],
@@ -675,6 +720,13 @@ def deserialize_keras_object(
 
     if class_name == "function":
         fn_name = inner_config
+        if not isinstance(fn_name, str):
+            raise TypeError(
+                "Expected 'config' to be a non-null str for"
+                "a function classname,\n"
+                f"instead got {type(fn_name)}\n"
+                f"Full config: {config}"
+            )
         return _retrieve_class_or_fn(
             fn_name,
             registered_name,
@@ -683,8 +735,13 @@ def deserialize_keras_object(
             full_config=config,
             custom_objects=custom_objects,
         )
-
     # Below, handling of all classes.
+    if not isinstance(inner_config, dict):
+        raise TypeError(
+            f"Expected 'config' to be a dict for {class_name},\n"
+            f"instead got {type(inner_config)}\n"
+            f"Full config: {config}"
+        )
     # First, is it a shared object?
     if "shared_object_id" in config:
         obj = get_shared_object(config["shared_object_id"])
@@ -741,6 +798,20 @@ def deserialize_keras_object(
     return instance
 
 
+def _assert_no_registered_name_for_builtin(full_config, name, resolved_name):
+    explicit = full_config.get("registered_name")
+    if not explicit:
+        return
+    if explicit in (name, full_config.get("class_name")):
+        return
+    raise ValueError(
+        f"`registered_name={explicit!r}` was provided in the config, but "
+        f"'{resolved_name}' resolved to a Keras built-in and does not use "
+        "registered names. Remove the `registered_name` field from the "
+        f"config. Full object config: {full_config}"
+    )
+
+
 def _retrieve_class_or_fn(
     name, registered_name, module, obj_type, full_config, custom_objects=None
 ):
@@ -763,10 +834,22 @@ def _retrieve_class_or_fn(
         # module name might not match the package structure
         # (e.g. experimental symbols).
         if module == "keras" or module.startswith("keras."):
-            api_name = module + "." + name
+            api_name = f"{module}.{name}"
+
+            if api_name in NON_MODELING_APIS:
+                raise ValueError(
+                    f"Cannot deserialize `{api_name}` because it is not a "
+                    "modeling function. Non-modeling APIs are disallowed "
+                    "during deserialization for security. Model configuration "
+                    "should only contains operations, layers, metrics, losses, "
+                    "or registered custom objects and functions."
+                )
 
             obj = api_export.get_symbol_from_name(api_name)
             if obj is not None:
+                _assert_no_registered_name_for_builtin(
+                    full_config, name, api_name
+                )
                 return obj
 
         # Configs of Keras built-in functions do not contain identifying
@@ -775,43 +858,48 @@ def _retrieve_class_or_fn(
         # the corresponding function from the identifying string.
         if obj_type == "function" and module == "builtins":
             for mod in BUILTIN_MODULES:
-                obj = api_export.get_symbol_from_name(
-                    "keras." + mod + "." + name
-                )
+                obj = api_export.get_symbol_from_name(f"keras.{mod}.{name}")
                 if obj is not None:
+                    _assert_no_registered_name_for_builtin(
+                        full_config, name, f"keras.{mod}.{name}"
+                    )
                     return obj
 
-            # Retrieval of registered custom function in a package
-            filtered_dict = {
-                k: v
-                for k, v in custom_objects.items()
-                if k.endswith(full_config["config"])
-            }
-            if filtered_dict:
-                return next(iter(filtered_dict.values()))
+            # Workaround for serialization bug in Keras <= 3.6 whereby custom
+            # functions would only be saved by name instead of registered name,
+            # i.e. "name" instead of "package>name". This allows recent versions
+            # of Keras to reload models saved with 3.6 and lower.
+            if ">" not in name:
+                separated_name = f">{name}"
+                for custom_name, custom_object in custom_objects.items():
+                    if custom_name.endswith(separated_name):
+                        return custom_object
 
         # Otherwise, attempt to retrieve the class object given the `module`
         # and `class_name`. Import the module, find the class.
-        try:
-            mod = importlib.import_module(module)
-        except ModuleNotFoundError:
-            raise TypeError(
-                f"Could not deserialize {obj_type} '{name}' because "
-                f"its parent module {module} cannot be imported. "
-                f"Full object config: {full_config}"
-            )
-        obj = vars(mod).get(name, None)
-
-        # Special case for keras.metrics.metrics
-        if obj is None and registered_name is not None:
-            obj = vars(mod).get(registered_name, None)
-
-        if obj is not None:
-            return obj
+        package = module.split(".", maxsplit=1)[0]
+        if package in {"keras", "keras_hub", "keras_cv", "keras_nlp"}:
+            try:
+                mod = importlib.import_module(module)
+                obj = vars(mod).get(name, None)
+                if isinstance(obj, type) and issubclass(obj, KerasSaveable):
+                    return obj
+                else:
+                    raise ValueError(
+                        f"Could not deserialize '{module}.{name}' because "
+                        "it is not a KerasSaveable subclass"
+                    )
+            except ModuleNotFoundError:
+                raise TypeError(
+                    f"Could not deserialize {obj_type} '{name}' because "
+                    f"its parent module {module} cannot be imported. "
+                    f"Full object config: {full_config}"
+                )
 
     raise TypeError(
-        f"Could not locate {obj_type} '{name}'. "
-        "Make sure custom classes are decorated with "
-        "`@keras.saving.register_keras_serializable()`. "
-        f"Full object config: {full_config}"
+        f"Could not locate {obj_type} '{name}'. Make sure custom classes and "
+        "functions are decorated with "
+        "`@keras.saving.register_keras_serializable()`. If they are already "
+        "decorated, make sure they are all imported so that the decorator is "
+        f"run before trying to load them. Full object config: {full_config}"
     )

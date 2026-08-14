@@ -2,17 +2,26 @@ import warnings
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from packaging.version import parse
+from torch.nn.parallel import DistributedDataParallel
 
 from keras.src import backend
 from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
+from keras.src.backend import config
+from keras.src.backend.torch.core import get_device
+from keras.src.backend.torch.distribution_lib import _to_backend_mesh
+from keras.src.distribution.distribution_lib import DataParallel
+from keras.src.distribution.distribution_lib import distribution
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
 from keras.src.trainers.epoch_iterator import EpochIterator
 from keras.src.utils import traceback_utils
+from keras.src.utils import tracking
+from keras.src.utils.python_utils import pythonify_logs
 
 
 class TorchTrainer(base_trainer.Trainer):
@@ -21,6 +30,7 @@ class TorchTrainer(base_trainer.Trainer):
         self.train_function = None
         self.test_function = None
         self.predict_function = None
+        self.ddp_model = None
 
     def _should_torch_compile(self):
         # require torch>=2.1.0 to enable dynamo since it
@@ -36,24 +46,73 @@ class TorchTrainer(base_trainer.Trainer):
 
         return self.jit_compile
 
+    @tracking.no_automatic_dependency_tracking
+    def _initialize_ddp(self):
+        if torch.distributed.is_initialized() and self.ddp_model is None:
+            active_distribution = distribution()
+
+            if active_distribution is None or isinstance(
+                active_distribution, DataParallel
+            ):
+                device = get_device()
+                device_str = str(device)
+                if device_str.startswith("cuda") or device_str.startswith(
+                    "xpu"
+                ):
+                    if ":" in device_str:
+                        device_ids = [int(device_str.split(":")[-1])]
+                    else:
+                        if device_str.startswith("cuda"):
+                            device_ids = [torch.cuda.current_device()]
+                        else:
+                            device_ids = [torch.xpu.current_device()]
+                else:
+                    device_ids = None
+
+                process_group = None
+                if active_distribution is not None:
+                    backend_mesh = _to_backend_mesh(
+                        active_distribution.device_mesh
+                    )
+                    process_group = backend_mesh.get_group(
+                        active_distribution.batch_dim_name
+                    )
+
+                # Bypass PyTorch submodule registration, which does not handle
+                # circular dependencies
+                object.__setattr__(
+                    self,
+                    "ddp_model",
+                    DistributedDataParallel(
+                        self,
+                        device_ids=device_ids,
+                        process_group=process_group,
+                        find_unused_parameters=False,
+                    ),
+                )
+
     def train_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
 
         # Compute predictions
+        model = self.ddp_model or self
         if self._call_has_training_arg:
-            y_pred = self(x, training=True)
+            y_pred = model(x, training=True)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
 
         # Call torch.nn.Module.zero_grad() to clear the leftover gradients
         # for the weights from the previous train step.
-        self.zero_grad()
+        model.zero_grad()
 
-        loss = self.compute_loss(
-            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight
+        loss = self._compute_loss(
+            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
         )
         self._loss_tracker.update_state(
-            loss, sample_weight=tree.flatten(x)[0].shape[0]
+            loss,
+            sample_weight=next(
+                i for i in tree.flatten(x) if i is not None
+            ).shape[0],
         )
         if self.optimizer is not None:
             loss = self.optimizer.scale_loss(loss)
@@ -81,87 +140,139 @@ class TorchTrainer(base_trainer.Trainer):
             y,
             sample_weight,
         ) = data_adapter_utils.unpack_x_y_sample_weight(data)
+        model = self.ddp_model or self
         if self._call_has_training_arg:
-            y_pred = self(x, training=False)
+            y_pred = model(x, training=False)
         else:
-            y_pred = self(x)
-        loss = self.compute_loss(
-            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight
+            y_pred = model(x)
+        loss = self._compute_loss(
+            x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
         self._loss_tracker.update_state(
-            loss, sample_weight=tree.flatten(x)[0].shape[0]
+            loss,
+            sample_weight=next(
+                i for i in tree.flatten(x) if i is not None
+            ).shape[0],
         )
         return self.compute_metrics(x, y, y_pred, sample_weight=sample_weight)
 
     def predict_step(self, data):
         x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data)
+        model = self.ddp_model or self
         if self._call_has_training_arg:
-            y_pred = self(x, training=False)
+            y_pred = model(x, training=False)
         else:
-            y_pred = self(x)
+            y_pred = model(x)
         return y_pred
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
             return self.train_function
 
-        if self.steps_per_execution > 1:
-            raise ValueError(
-                "`steps_per_execution` must be 1 with the PyTorch backend. "
-                f"Received: steps_per_execution={self.steps_per_execution}"
-            )
+        self._initialize_ddp()
 
-        def one_step_on_data(data):
-            """Runs a single training step on a batch of data."""
-            data = data[0]
-            return self.train_step(data)
-
+        train_step = self.train_step
         if self._should_torch_compile():
-            self.train_function = torch.compile(one_step_on_data)
-        else:
-            self.train_function = one_step_on_data
+            train_step = torch.compile(train_step)
+
+        def train_function(data):
+            """Runs training steps on a list of batches of data."""
+            logs = {}
+            for step_data in data:
+                logs = train_step(step_data)
+            return logs
+
+        self.train_function = train_function
 
     def make_test_function(self, force=False):
         if self.test_function is not None and not force:
             return self.test_function
 
-        if self.steps_per_execution > 1:
-            raise ValueError(
-                "`steps_per_execution` must be 1 with the PyTorch backend. "
-                f"Received: steps_per_execution={self.steps_per_execution}"
-            )
+        self._initialize_ddp()
 
-        def one_step_on_data(data):
-            """Runs a single test step on a batch of data."""
-            data = data[0]
-            with torch.no_grad():
-                return self.test_step(data)
-
+        test_step = self.test_step
         if self._should_torch_compile():
-            self.test_function = torch.compile(one_step_on_data)
-        else:
-            self.test_function = one_step_on_data
+            test_step = torch.compile(test_step)
+
+        def test_function(data):
+            """Runs test steps on a list of batches of data."""
+            logs = {}
+            with torch.no_grad():
+                for step_data in data:
+                    logs = test_step(step_data)
+            return logs
+
+        self.test_function = test_function
+
+    def get_metrics_result(self):
+        if torch.distributed.is_initialized():
+            with torch.no_grad():
+                active_distribution = distribution()
+                process_group = None
+                if active_distribution is not None:
+                    backend_mesh = _to_backend_mesh(
+                        active_distribution.device_mesh
+                    )
+                    process_group = backend_mesh.get_group(
+                        active_distribution.batch_dim_name
+                    )
+
+                reduced_vars = []
+                for v in self.metrics_variables:
+                    # Use a copy for reduction to avoid modifying
+                    # the original variable.
+                    val = v.value.clone()
+                    dist.all_reduce(
+                        val,
+                        op=dist.ReduceOp.SUM,
+                        group=process_group,
+                    )
+                    reduced_vars.append(val)
+
+                with backend.StatelessScope(
+                    state_mapping=list(
+                        zip(self.metrics_variables, reduced_vars)
+                    )
+                ):
+                    results = super().get_metrics_result()
+
+                return {
+                    k: val.clone() if isinstance(val, torch.Tensor) else val
+                    for k, val in results.items()
+                }
+
+        return super().get_metrics_result()
 
     def make_predict_function(self, force=False):
         if self.predict_function is not None and not force:
             return self.predict_function
 
-        if self.steps_per_execution > 1:
-            raise ValueError(
-                "`steps_per_execution` must be 1 with the PyTorch backend. "
-                f"Received: steps_per_execution={self.steps_per_execution}"
-            )
+        self._initialize_ddp()
 
-        def one_step_on_data(data):
-            """Runs a predict test step on a batch of data."""
-            data = data[0]
-            with torch.no_grad():
-                return self.predict_step(data)
-
+        predict_step = self.predict_step
         if self._should_torch_compile():
-            self.predict_function = torch.compile(one_step_on_data)
-        else:
-            self.predict_function = one_step_on_data
+            predict_step = torch.compile(predict_step)
+
+        def predict_function(data):
+            """Runs predict steps on a list of batches of data."""
+            outputs = []
+            with torch.no_grad():
+                for step_data in data:
+                    outputs.append(predict_step(step_data))
+
+            def concat_outputs(outputs):
+                if not outputs:
+                    return []
+                if len(outputs) == 1:
+                    return outputs[0]
+                return tree.map_structure(
+                    lambda *args: torch.cat(args, dim=0),
+                    *outputs,
+                )
+
+            return concat_outputs(outputs)
+
+        self.predict_function = predict_function
 
     @traceback_utils.filter_traceback
     def fit(
@@ -183,10 +294,12 @@ class TorchTrainer(base_trainer.Trainer):
         validation_batch_size=None,
         validation_freq=1,
     ):
-        if not self.compiled:
-            raise ValueError(
-                "You must call `compile()` before calling `fit()`."
-            )
+        self._assert_compile_called("fit")
+        # Possibly cap epochs for debugging runs.
+        max_epochs = config.max_epochs()
+        if max_epochs and max_epochs < epochs:
+            warnings.warn("Limiting epochs to %d" % max_epochs)
+            epochs = max_epochs
 
         # TODO: respect compiled trainable state
         self._eval_epoch_iterator = None
@@ -195,10 +308,9 @@ class TorchTrainer(base_trainer.Trainer):
             # for TF/numpy/jax arrays.
             # TODO: Support torch tensors for validation data.
             (
-                x,
-                y,
-                sample_weight,
-            ), validation_data = array_slicing.train_validation_split(
+                (x, y, sample_weight),
+                validation_data,
+            ) = array_slicing.train_validation_split(
                 (x, y, sample_weight), validation_split=validation_split
             )
 
@@ -222,6 +334,7 @@ class TorchTrainer(base_trainer.Trainer):
         )
 
         self._symbolic_build(iterator=epoch_iterator)
+        epoch_iterator.reset()
 
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
@@ -236,6 +349,7 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         self.stop_training = False
+        training_logs = {}
         self.make_train_function()
         callbacks.on_train_begin()
         initial_epoch = self._initial_epoch or initial_epoch
@@ -247,15 +361,16 @@ class TorchTrainer(base_trainer.Trainer):
             # do training behavior in case the user did not use `self.training`
             # when implementing a custom layer with torch layers.
             self.train()
-            for step, data in epoch_iterator.enumerate_epoch():
+
+            logs = {}
+            for begin_step, end_step, data in epoch_iterator:
                 # Callbacks
-                callbacks.on_train_batch_begin(step)
+                callbacks.on_train_batch_begin(begin_step)
 
                 logs = self.train_function(data)
-                logs = self._pythonify_logs(logs)
 
                 # Callbacks
-                callbacks.on_train_batch_end(step, logs)
+                callbacks.on_train_batch_end(end_step, logs)
                 if self.stop_training:
                     break
 
@@ -291,7 +406,7 @@ class TorchTrainer(base_trainer.Trainer):
                     _use_cached_eval_dataset=True,
                 )
                 val_logs = {
-                    "val_" + name: val for name, val in val_logs.items()
+                    f"val_{name}": val for name, val in val_logs.items()
                 }
                 epoch_logs.update(val_logs)
 
@@ -345,12 +460,12 @@ class TorchTrainer(base_trainer.Trainer):
             )
 
         self._symbolic_build(iterator=epoch_iterator)
+        epoch_iterator.reset()
 
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
                 callbacks,
-                add_history=True,
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=1,
@@ -364,16 +479,15 @@ class TorchTrainer(base_trainer.Trainer):
         self.make_test_function()
         self.stop_evaluating = False
         callbacks.on_test_begin()
-        logs = None
+        logs = {}
         self.reset_metrics()
-        for step, data in epoch_iterator.enumerate_epoch():
-            callbacks.on_test_batch_begin(step)
+        for begin_step, end_step, data in epoch_iterator:
+            callbacks.on_test_batch_begin(begin_step)
             logs = self.test_function(data)
-            logs = self._pythonify_logs(logs)
-            callbacks.on_test_batch_end(step, logs)
+            callbacks.on_test_batch_end(end_step, logs)
             if self.stop_evaluating:
                 break
-        logs = self._get_metrics_result_or_logs(logs)
+        logs = pythonify_logs(self._get_metrics_result_or_logs(logs))
         callbacks.on_test_end(logs)
 
         if return_dict:
@@ -397,7 +511,6 @@ class TorchTrainer(base_trainer.Trainer):
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
                 callbacks,
-                add_history=True,
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=1,
@@ -427,11 +540,11 @@ class TorchTrainer(base_trainer.Trainer):
         self.stop_predicting = False
         callbacks.on_predict_begin()
         outputs = None
-        for step, data in epoch_iterator.enumerate_epoch():
-            callbacks.on_predict_batch_begin(step)
+        for begin_step, end_step, data in epoch_iterator:
+            callbacks.on_predict_batch_begin(begin_step)
             batch_outputs = self.predict_function(data)
             outputs = append_to_outputs(batch_outputs, outputs)
-            callbacks.on_predict_batch_end(step, {"outputs": batch_outputs})
+            callbacks.on_predict_batch_end(end_step, {"outputs": batch_outputs})
             if self.stop_predicting:
                 break
         callbacks.on_predict_end()
@@ -464,9 +577,10 @@ class TorchTrainer(base_trainer.Trainer):
         # Maybe build model
         self._symbolic_build(data_batch=data)
         self.make_train_function()
+        self.reset_metrics()
 
         logs = self.train_function([data])
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = pythonify_logs(logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
@@ -485,9 +599,10 @@ class TorchTrainer(base_trainer.Trainer):
         # Maybe build model
         self._symbolic_build(data_batch=data)
         self.make_test_function()
+        self.reset_metrics()
 
         logs = self.test_function([data])
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = pythonify_logs(logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)

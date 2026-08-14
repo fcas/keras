@@ -40,6 +40,25 @@ def get_nested_sequential_model():
     return model
 
 
+def get_doubly_nested_functional_model():
+    """Outer -> middle (Functional) -> inner (Functional), 3 nesting levels."""
+    inputs = layers.Input(shape=(5,))
+    x = layers.Dense(4)(inputs)
+    middle = get_nested_functional_model()  # already contains an inner mlp
+    x = middle(x)
+    outputs = layers.Dense(2)(x)
+    return models.Model(inputs, outputs)
+
+
+def get_doubly_nested_sequential_model():
+    """Outer -> middle (Sequential) -> inner (Sequential), 3 nesting levels."""
+    model = models.Sequential()
+    model.add(layers.Dense(3))
+    model.add(get_nested_sequential_model())
+    model.add(layers.Dense(2))
+    return model
+
+
 def get_cnn_functional_model(shared_layers=False):
     inputs = layers.Input(shape=(7, 3))
     x = layers.Conv1D(2, 2, padding="same")(inputs)
@@ -61,6 +80,15 @@ def get_sequential_model(explicit_input=True):
     return model
 
 
+def get_cnn_sequential_model(explicit_input=True):
+    model = models.Sequential()
+    if explicit_input:
+        model.add(layers.Input(shape=(7, 3)))
+    model.add(layers.Conv1D(2, 2, padding="same"))
+    model.add(layers.Conv1D(2, 2, padding="same"))
+    return model
+
+
 def get_subclassed_model():
     class ExampleModel(models.Model):
         def __init__(self, **kwargs):
@@ -75,8 +103,7 @@ def get_subclassed_model():
 
 
 @pytest.mark.requires_trainable_backend
-class CloneModelTest(testing.TestCase, parameterized.TestCase):
-
+class CloneModelTest(testing.TestCase):
     def assert_models_equal(self, model1, model2, ref_input):
         result1 = model1(ref_input)
         result2 = model2(ref_input)
@@ -116,14 +143,31 @@ class CloneModelTest(testing.TestCase, parameterized.TestCase):
     def test_custom_clone_function(self, model_fn):
         def clone_function(layer):
             config = layer.get_config()
-            config["name"] = config["name"] + "_custom"
+            config["name"] = f"{config['name']}_custom"
             return layer.__class__.from_config(config)
 
         model = model_fn()
         new_model = clone_model(model, clone_function=clone_function)
         for l1, l2 in zip(model.layers, new_model.layers):
             if not isinstance(l1, layers.InputLayer):
-                self.assertEqual(l2.name, l1.name + "_custom")
+                self.assertEqual(l2.name, f"{l1.name}_custom")
+
+    @parameterized.named_parameters(
+        ("cnn_functional", get_cnn_functional_model),
+        ("cnn_sequential", get_cnn_sequential_model),
+        (
+            "cnn_sequential_noinputlayer",
+            lambda: get_cnn_sequential_model(explicit_input=False),
+        ),
+    )
+    def test_input_tensors(self, model_fn):
+        ref_input = np.random.random((2, 7, 3))
+        model = model_fn()
+        model(ref_input)  # Maybe needed to get model inputs if no Input layer
+        input_tensor = model.inputs[0]
+        new_model = clone_model(model, input_tensors=input_tensor)
+        tree.assert_same_structure(model.inputs, new_model.inputs)
+        tree.assert_same_structure(model.outputs, new_model.outputs)
 
     def test_shared_layers_cloning(self):
         model = get_mlp_functional_model(shared_layers=True)
@@ -217,3 +261,61 @@ class CloneModelTest(testing.TestCase, parameterized.TestCase):
             if isinstance(l2, layers.Dense):
                 self.assertFalse(hasattr(l1, "flag"))
                 self.assertTrue(hasattr(l2, "flag"))
+
+    def test_recursive_multi_level(self):
+        # Functional: 3 nesting levels (outer -> middle -> inner).
+        # Before the fix, recursive=True was not forwarded in the
+        # recursive clone_model() calls, so only the first nesting
+        # level was entered. The inner-most Dense layers would be
+        # shared rather than cloned.
+        model = get_doubly_nested_functional_model()
+
+        def clone_function(layer):
+            layer = layer.__class__.from_config(layer.get_config())
+            layer.flag = True
+            return layer
+
+        new_model = clone_model(
+            model,
+            clone_function=clone_function,
+            recursive=True,
+        )
+        ref_input = np.random.random((2, 5))
+        model(ref_input)
+        new_model(ref_input)
+        new_model.set_weights(model.get_weights())
+        self.assert_models_equal(model, new_model, ref_input)
+
+        # Every Dense in the deepest level should have been cloned
+        # (i.e. clone_function was applied), not shared.
+        for l1, l2 in zip(model._flatten_layers(), new_model._flatten_layers()):
+            if isinstance(l2, layers.Dense):
+                self.assertFalse(hasattr(l1, "flag"))
+                self.assertTrue(hasattr(l2, "flag"))
+
+        # Sequential: 3 nesting levels.
+        model = get_doubly_nested_sequential_model()
+        new_model = clone_model(
+            model,
+            clone_function=clone_function,
+            recursive=True,
+        )
+        ref_input = np.random.random((2, 5))
+        model(ref_input)
+        new_model(ref_input)
+        new_model.set_weights(model.get_weights())
+        self.assert_models_equal(model, new_model, ref_input)
+
+        for l1, l2 in zip(model._flatten_layers(), new_model._flatten_layers()):
+            if isinstance(l2, layers.Dense):
+                self.assertFalse(hasattr(l1, "flag"))
+                self.assertTrue(hasattr(l2, "flag"))
+
+    def test_compiled_model_cloning(self):
+        model = models.Sequential()
+        model.add(layers.Input((3,)))
+        model.add(layers.Dense(5, activation="relu"))
+        model.add(layers.Dense(1, activation="sigmoid"))
+        model.compile(optimizer="adam", loss="binary_crossentropy")
+        cloned_model = clone_model(model)
+        self.assertEqual(model.compiled, cloned_model.compiled)

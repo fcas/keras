@@ -7,6 +7,7 @@ from keras.src.backend.common import keras_tensor
 from keras.src.layers import Dense
 from keras.src.layers import Input
 from keras.src.models import Model
+from keras.src.models import Sequential
 from keras.src.ops import function
 from keras.src.ops import numpy as knp
 
@@ -54,6 +55,11 @@ class FunctionTest(testing.TestCase):
         out = fn.compute_output_spec(keras_tensor.KerasTensor((4, 3)))
         self.assertIsInstance(out, keras_tensor.KerasTensor)
         self.assertEqual(out.shape, (4, 3))
+
+        # Test with compute_output_shape
+        out = fn.compute_output_shape((None, 3))
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(out, (None, 3))
 
         # Test with call
         out = fn(keras_tensor.KerasTensor((4, 3)))
@@ -108,10 +114,6 @@ class FunctionTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "incompatible inputs"):
             _ = fn([np.ones((4, 3)), np.ones((2, 3))])
 
-    def test_graph_disconnected_error(self):
-        # TODO
-        pass
-
     def test_serialization(self):
         inputs = Input(shape=(10,))
         outputs = Dense(1)(inputs)
@@ -137,3 +139,62 @@ class FunctionTest(testing.TestCase):
             ValueError, "`inputs` argument cannot be empty"
         ):
             _ = function.Function(inputs=[], outputs=x)
+
+    def test_function_with_unconnected_inputs(self):
+        model_1 = Sequential(
+            [
+                Input(shape=(6,)),
+                Dense(3, activation="sigmoid"),
+            ]
+        )
+        model_2 = Sequential(
+            [
+                Input(shape=(3,)),
+                Dense(2, activation="sigmoid"),
+            ],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "Output .* is not connected to `inputs`"
+        ):
+            _ = Model(Input(shape=(6,)), model_2(model_1(Input(shape=(6,)))))
+
+        with self.assertRaisesRegex(
+            ValueError, "Output .* is not connected to `inputs`"
+        ):
+            _ = Model(model_1(Input(shape=(6,))), model_2(Input(shape=(3,))))
+
+    def test_function_with_intermediate_tensor_input(self):
+        """Function with intermediate tensor as input should exclude
+        operations that produce those tensors."""
+        x = Input(batch_shape=(), name="x")
+        y = x**2
+        z = y + 1
+        fn = function.Function(y, z)
+
+        # The power operation produces `y` but is outside the graph
+        # boundary. Only the add operation should be included.
+        op_names = [op.name for op in fn.operations]
+        self.assertNotIn("power", op_names)
+        self.assertIn("add", op_names)
+
+        # Verify the function computes correctly (input is y, output is y+1)
+        result = fn(np.array(3.0))
+        self.assertAllClose(result, np.array(4.0))  # 3 + 1 = 4
+
+    def test_function_with_intermediate_tensor_input_chain(self):
+        """Function with intermediate tensor input from a longer chain."""
+        x = Input(batch_shape=(None, 3), name="x")
+        a = x * 2
+        b = a + 1
+        c = b**2
+        fn = function.Function(b, c)
+
+        op_names = [op.name for op in fn.operations]
+        # Only the power op (producing c from b) should be in the graph.
+        # multiply and add that produce a and b are outside.
+        self.assertNotIn("multiply", op_names)
+        self.assertNotIn("add", op_names)
+        self.assertIn("power", op_names)
+
+        result = fn(np.ones((2, 3)) * 3)
+        self.assertAllClose(result, np.ones((2, 3)) * 9)  # 3^2 = 9

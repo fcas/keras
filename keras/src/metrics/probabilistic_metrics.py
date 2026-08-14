@@ -69,9 +69,7 @@ class Poisson(reduction_metrics.MeanMetricWrapper):
         name: (Optional) string name of the metric instance.
         dtype: (Optional) data type of the metric result.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> m = keras.metrics.Poisson()
     >>> m.update_state([[0, 1], [0, 0]], [[1, 1], [0, 0]])
@@ -119,9 +117,7 @@ class BinaryCrossentropy(reduction_metrics.MeanMetricWrapper):
             e.g. `label_smoothing=0.2` means that we will use
             a value of 0.1 for label "0" and 0.9 for label "1".
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> m = keras.metrics.BinaryCrossentropy()
     >>> m.update_state([[0, 1], [0, 0]], [[0.6, 0.4], [0.4, 0.6]])
@@ -195,9 +191,7 @@ class CategoricalCrossentropy(reduction_metrics.MeanMetricWrapper):
         axis: (Optional) Defaults to `-1`.
             The dimension along which entropy is computed.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> # EPSILON = 1e-7, y = y_true, y` = y_pred
     >>> # y` = clip_ops.clip_by_value(output, EPSILON, 1. - EPSILON)
@@ -279,12 +273,12 @@ class SparseCategoricalCrossentropy(reduction_metrics.MeanMetricWrapper):
         from_logits: (Optional) Whether output is expected
             to be a logits tensor. By default, we consider that output
             encodes a probability distribution.
+        ignore_class: (Optional) Integer.
+            Class to ignore. If `None`, no class is ignored.
         axis: (Optional) Defaults to `-1`.
             The dimension along which entropy is computed.
 
-    Example:
-
-    Example:
+    Examples:
 
     >>> # y_true = one_hot(y_true) = [[0, 1, 0], [0, 0, 1]]
     >>> # logits = log(y_pred)
@@ -324,6 +318,7 @@ class SparseCategoricalCrossentropy(reduction_metrics.MeanMetricWrapper):
         name="sparse_categorical_crossentropy",
         dtype=None,
         from_logits=False,
+        ignore_class=None,
         axis=-1,
     ):
         super().__init__(
@@ -331,9 +326,11 @@ class SparseCategoricalCrossentropy(reduction_metrics.MeanMetricWrapper):
             name=name,
             dtype=dtype,
             from_logits=from_logits,
+            ignore_class=ignore_class,
             axis=axis,
         )
         self.from_logits = from_logits
+        self.ignore_class = ignore_class
         self.axis = axis
         # Metric should be minimized during optimization.
         self._direction = "down"
@@ -343,5 +340,6 @@ class SparseCategoricalCrossentropy(reduction_metrics.MeanMetricWrapper):
             "name": self.name,
             "dtype": self.dtype,
             "from_logits": self.from_logits,
+            "ignore_class": self.ignore_class,
             "axis": self.axis,
         }

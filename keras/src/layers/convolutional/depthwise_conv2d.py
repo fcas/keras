@@ -93,9 +93,9 @@ class DepthwiseConv2D(BaseDepthwiseConv):
     Example:
 
     >>> x = np.random.rand(4, 10, 10, 12)
-    >>> y = keras.layers.DepthwiseConv2D(3, 3, activation='relu')(x)
+    >>> y = keras.layers.DepthwiseConv2D(kernel_size=3, activation='relu')(x)
     >>> print(y.shape)
-    (4, 8, 8, 36)
+    (4, 8, 8, 12)
     """
 
     def __init__(
@@ -115,7 +115,7 @@ class DepthwiseConv2D(BaseDepthwiseConv):
         activity_regularizer=None,
         depthwise_constraint=None,
         bias_constraint=None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(
             rank=2,
@@ -134,5 +134,5 @@ class DepthwiseConv2D(BaseDepthwiseConv):
             activity_regularizer=activity_regularizer,
             depthwise_constraint=depthwise_constraint,
             bias_constraint=bias_constraint,
-            **kwargs
+            **kwargs,
         )

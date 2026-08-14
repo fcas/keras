@@ -15,7 +15,7 @@ class AdamW(adam.Adam):
 
     According to
     [Kingma et al., 2014](http://arxiv.org/abs/1412.6980),
-    the underying Adam method is "*computationally
+    the underlying Adam method is "*computationally
     efficient, has little memory requirement, invariant to diagonal rescaling of
     gradients, and is well suited for problems that are large in terms of
     data/parameters*".
@@ -66,7 +66,7 @@ class AdamW(adam.Adam):
         ema_overwrite_frequency=None,
         loss_scale_factor=None,
         gradient_accumulation_steps=None,
-        name="adamw",
+        name=None,
         **kwargs,
     ):
         super().__init__(
@@ -95,6 +95,7 @@ class AdamW(adam.Adam):
             )
 
 
-AdamW.__doc__ = AdamW.__doc__.replace(
-    "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
-)
+if AdamW.__doc__ is not None:
+    AdamW.__doc__ = AdamW.__doc__.replace(
+        "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
+    )

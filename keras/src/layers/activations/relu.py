@@ -17,7 +17,7 @@ class ReLU(Layer):
 
     Example:
     ``` python
-    relu_layer = keras.layers.activations.ReLU(
+    relu_layer = keras.layers.ReLU(
         max_value=10,
         negative_slope=0.5,
         threshold=0,
@@ -28,8 +28,8 @@ class ReLU(Layer):
     ```
 
     Args:
-        max_value: Float >= 0. Maximum activation value. None means unlimited.
-            Defaults to `None`.
+        max_value: Float >= 0. Maximum activation value. `None` means
+            unlimited. Defaults to `None`.
         negative_slope: Float >= 0. Negative slope coefficient.
             Defaults to `0.0`.
         threshold: Float >= 0. Threshold value for thresholded activation.
@@ -48,19 +48,21 @@ class ReLU(Layer):
             )
         if negative_slope is None or negative_slope < 0.0:
             raise ValueError(
-                "negative_slope of a ReLU layer cannot be a negative "
-                f"value. Received: negative_slope={negative_slope}"
+                "negative_slope of a ReLU layer cannot be None or a "
+                f"negative value. Received: negative_slope={negative_slope}"
             )
         if threshold is None or threshold < 0.0:
             raise ValueError(
-                "threshold of a ReLU layer cannot be a negative "
-                f"value. Received: threshold={threshold}"
+                "threshold of a ReLU layer cannot be None or a "
+                f"negative value. Received: threshold={threshold}"
             )
 
-        self.supports_masking = True
         self.max_value = max_value
         self.negative_slope = negative_slope
         self.threshold = threshold
+        self.supports_masking = True
+
+        self._build_at_init()
 
     def call(self, inputs):
         return activations.relu(

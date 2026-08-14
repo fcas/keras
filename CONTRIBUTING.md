@@ -2,9 +2,11 @@ Keras 3 is a high-velocity open-source project. We welcome contributions!
 
 Contributions can be made in a variety of ways, including coding, enriching documentation, refining docstrings, and providing code examples.
 
+Please review our
+[AI-Assisted Contribution Policy](#ai-assisted-contribution-policy).
 
 ## Current items open for contributions
-At [this link](https://github.com/keras-team/keras/issues/18442), you'll find a list of items where you help is needed!
+At [this link](https://github.com/keras-team/keras/issues/18442), you'll find a list of items where your help is needed!
 
 
 ## How to contribute code
@@ -15,7 +17,8 @@ Follow these steps to submit your code contribution.
 
 Before making any changes, we recommend opening an issue (if one doesn't already
 exist) and discussing your proposed changes. This way, we can give you feedback
-and validate the proposed changes.
+and validate the proposed changes. Unsolicited PRs that attempt to fix complex
+issues without prior discussion in a GitHub issue may be closed.
 
 If the changes are minor (simple bug fix or documentation fix), then feel free
 to open a Pull Request (PR) without discussion.
@@ -83,7 +86,7 @@ To set up your local dev environment, you will need the following tools.
 2.  [python](https://www.python.org/) to build and code in Keras.
 
 The following commands check the tools above are successfully installed. Note
-that Keras requires at least Python 3.9 to run.
+that Keras requires at least Python 3.10 to run.
 
 ```shell
 git --version
@@ -107,23 +110,35 @@ You can also add GPU support to your environment, see the
 [Adding GPU support](https://github.com/keras-team/keras/blob/master/README.md#adding-gpu-support)
 section of the README.
 
-## Code style
+## Generating public API and formatting the code
 
-Keras uses [Black](https://black.readthedocs.io/en/stable/) and
-[isort](https://pycqa.github.io/isort/) to format the code. Please refer to
-[requirements-common.txt](https://github.com/keras-team/keras/blob/master/requirements-common.txt)
-for the required versions. Run the following command **at the root directory of
-the repo** to format your code.
+For the first time you are setting up the repo, please run `pre-commit install`.
+Note that this needs to be done only once at the beginning.
+
+Now, whenever you run `git commit -m "<message>"`, three things are
+automatically done:
+
+- Public API generation
+- Code formatting
+- Code linting
+
+If there's any error, the commit will not go through. Please fix the error (
+most of the times, the error is fixed automatically by the formatter/linter) and
+re-run the following:
 
 ```
-sh shell/format.sh
+git add .
+git commit -m "<message>" # This will not get logged as a duplicate commit.
 ```
 
-It will also display the errors that cannot be resolved by autoformatting. You
-need to follow the output of the command to resolve them manually.
+In case you want to run the above manually on all files, you can do the
+following:
 
-If you do not want to auto format the code but only show the lint errors, you
-can run `sh shell/lint.sh` **at the root directory of the repo**.
+```
+pre-commit run --all-files
+```
+
+KerasHub uses [Ruff](https://docs.astral.sh/ruff/) to format the code.
 
 ### Docstrings
 
@@ -163,11 +178,11 @@ We use [pytest](https://pytest.org/) to run the tests.
 
 ### Run a test file
 
-To run the tests in `keras/losses/losses_test.py`, use the following command
+To run the tests in `keras/src/losses/losses_test.py`, use the following command
 at the root directory of the repo.
 
 ```shell
-pytest keras/losses/losses_test.py
+pytest keras/src/losses/losses_test.py
 ```
 
 ### Run a single test case
@@ -175,13 +190,13 @@ pytest keras/losses/losses_test.py
 You can specify a single test class to run within a file.
 
 ```shell
-pytest keras/losses/losses_test.py::MeanSquaredErrorTest
+pytest keras/src/losses/losses_test.py::MeanSquaredErrorTest
 ```
 
 You can also specify a single test method to run within a class.
 
 ```shell
-pytest keras/losses/losses_test.py::MeanSquaredErrorTest::test_sample_weighted
+pytest keras/src/losses/losses_test.py::MeanSquaredErrorTest::test_sample_weighted
 ```
 
 ### Run all tests
@@ -207,3 +222,75 @@ command line.
 ```shell
 KERAS_BACKEND=jax SKIP_APPLICATIONS_TESTS=True pytest keras
 ```
+
+## GitHub Actions Security Validation
+
+Pull requests modifying GitHub Actions workflows are automatically validated using Zizmor.
+Before requesting review:
+
+- Resolve all Zizmor findings whenever possible.
+- Run Zizmor locally when modifying workflow files (e.g., using `uvx zizmor .github/` or `pipx run zizmor .github/`).
+- Use `# zizmor: ignore[rule-name]` only for verified false positives.
+  - Examples: `# zizmor: ignore[cache-poisoning]`, `# zizmor: ignore[dangerous-triggers]`.
+  - For a full list of rules, see the [Zizmor Rules Documentation](https://docs.zizmor.sh/audits/).
+- Every suppression must include a clear justification explaining why the finding is safe.
+
+## AI-Assisted Contribution Policy
+
+The Keras project relies on a vibrant, collaborative open-source community. As
+an organization at the forefront of machine learning, we recognize and support
+the use of AI-assisted coding tools to enhance developer productivity.
+
+The ultimate responsibility for any code contributed to Keras rests entirely
+with the human author. To maintain the high quality, security, and architectural
+integrity of the Keras codebase, and to respect the time of our maintainers, we
+require all contributors to adhere to the following policy.
+
+### 1. Disclosure Requirements
+
+If you used an AI coding agent in any capacity in the process of creating the
+pull request, you must disclose this in the PR description. This provides
+necessary context for the reviewers. By opening a pull request which includes AI
+generated code, you accept all responsibility for the code in question and
+guarantee that the content of the pull request complies with the terms of Keras’
+open source license and intellectual property policies.
+
+### 2. Acceptable vs. Unacceptable Use
+
+#### Acceptable Use:
+
+- Using AI tools while writing code you understand.
+- Generating boilerplate code, documentation drafts, or unit test templates that
+  you manually review, refine, and test.
+- Using LLMs to help you understand a complex bug or explain a piece of the
+  existing Keras codebase locally.
+
+#### Unacceptable Use:
+
+- **Zero-Review Agent PRs:** Allowing an autonomous AI agent to read an issue,
+  generate a patch, and open a Pull Request without comprehensive manual review
+  and testing by you.
+- **Blind Copy-Pasting:** Submitting patches generated by an LLM where you do
+  not fully grasp the underlying mechanics of the fix.
+- **AI-Generated Code Review Responses:** Using an LLM to automatically generate
+  replies to maintainer feedback. Code reviews require human-to-human
+  communication. If a maintainer asks an architectural question, you must answer
+  it yourself.
+
+### 3. Enforcement and PR Closure
+
+To keep the project moving efficiently, the Keras maintainer team reserves the
+right to enforce this policy strictly:
+
+- **Unaddressed Feedback:** If a maintainer leaves structural or architectural
+  feedback and the PR is abandoned, or the responses demonstrate a lack of
+  understanding of the submitted code, the PR will be closed.
+- **Policy Violation:** Repeated submission of low-effort, poorly understood
+  AI-generated code will result in PR closure and potential restriction from
+  contributing to the repository.
+
+### Acknowledgment
+
+By submitting a Pull Request to Keras, you confirm that you have read this
+policy, understand the code you are submitting, and take full responsibility for
+its accuracy and integration into the codebase.

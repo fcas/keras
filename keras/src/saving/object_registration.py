@@ -126,7 +126,7 @@ def register_keras_serializable(package="Custom", name=None):
 
     Args:
         package: The package that this class belongs to. This is used for the
-            `key` (which is `"package>name"`) to idenfify the class. Note that
+            `key` (which is `"package>name"`) to identify the class. Note that
             this is the first argument passed into the decorator.
         name: The name to serialize this class under in this package. If not
             provided or `None`, the class' name will be used (note that this is
@@ -140,7 +140,7 @@ def register_keras_serializable(package="Custom", name=None):
     def decorator(arg):
         """Registers a class with the Keras serialization framework."""
         class_name = name if name is not None else arg.__name__
-        registered_name = package + ">" + class_name
+        registered_name = f"{package}>{class_name}"
 
         if inspect.isclass(arg) and not hasattr(arg, "get_config"):
             raise ValueError(

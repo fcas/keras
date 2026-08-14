@@ -1,12 +1,15 @@
+import numpy as np
+
 from keras.src.backend.common.backend_utils import (
-    _convert_conv_tranpose_padding_args_from_keras_to_jax,
+    _convert_conv_transpose_padding_args_from_keras_to_jax,
 )
 from keras.src.backend.common.backend_utils import (
-    _convert_conv_tranpose_padding_args_from_keras_to_torch,
+    _convert_conv_transpose_padding_args_from_keras_to_torch,
 )
 from keras.src.backend.common.backend_utils import (
     _get_output_shape_given_tf_padding,
 )
+from keras.src.backend.common.backend_utils import canonicalize_axes
 from keras.src.backend.common.backend_utils import (
     compute_conv_transpose_padding_args_for_jax,
 )
@@ -22,7 +25,7 @@ class ConvertConvTransposePaddingArgsJAXTest(test_case.TestCase):
         (
             left_pad,
             right_pad,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_jax(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_jax(
             kernel_size=3,
             stride=2,
             dilation_rate=1,
@@ -37,7 +40,7 @@ class ConvertConvTransposePaddingArgsJAXTest(test_case.TestCase):
         (
             left_pad,
             right_pad,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_jax(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_jax(
             kernel_size=3,
             stride=2,
             dilation_rate=1,
@@ -54,7 +57,7 @@ class ConvertConvTransposePaddingArgsTorchTest(test_case.TestCase):
         (
             torch_padding,
             torch_output_padding,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_torch(
             kernel_size=3,
             stride=2,
             dilation_rate=1,
@@ -69,7 +72,7 @@ class ConvertConvTransposePaddingArgsTorchTest(test_case.TestCase):
         (
             torch_padding,
             torch_output_padding,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_torch(
             kernel_size=3,
             stride=2,
             dilation_rate=1,
@@ -145,7 +148,7 @@ class ComputeConvTransposePaddingArgsForTorchTest(test_case.TestCase):
         (
             torch_padding,
             torch_output_padding,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_torch(
             kernel_size=3,
             stride=2,
             dilation_rate=1,
@@ -160,7 +163,7 @@ class ComputeConvTransposePaddingArgsForTorchTest(test_case.TestCase):
         (
             torch_padding,
             torch_output_padding,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_torch(
             kernel_size=3,
             stride=2,
             dilation_rate=1,
@@ -169,6 +172,44 @@ class ComputeConvTransposePaddingArgsForTorchTest(test_case.TestCase):
         )
         self.assertEqual(torch_padding, 0)
         self.assertEqual(torch_output_padding, 1)
+
+    def test_output_padding_clamped_for_torch_constraint(self):
+        """Test that output_padding is clamped
+        when >= stride (Torch constraint).
+        """
+        (
+            torch_paddings,
+            torch_output_paddings,
+        ) = compute_conv_transpose_padding_args_for_torch(
+            input_shape=(1, 8, 8, 8, 16),  # any shape
+            kernel_shape=(2, 2, 2, 16, 32),  # Keras kernel shape
+            strides=1,
+            padding="same",
+            output_padding=1,  # Keras wants this
+            dilation_rate=1,
+        )
+        # Torch expects output_padding < stride (1)
+        # so output_padding should be clamped to 0
+        self.assertEqual(torch_output_paddings, [0, 0, 0])
+
+
+class CanonicalizeAxesTest(test_case.TestCase):
+    def test_int_axis(self):
+        self.assertEqual(canonicalize_axes(-1, 4), (3,))
+
+    def test_numpy_int_axis(self):
+        self.assertEqual(canonicalize_axes(np.int64(-1), 4), (3,))
+
+    def test_sequence_axis(self):
+        self.assertEqual(canonicalize_axes([0, -1], 4), (0, 3))
+
+    def test_invalid_axis_type(self):
+        with self.assertRaises(TypeError):
+            canonicalize_axes("1", 4)
+
+    def test_invalid_axis_element_type(self):
+        with self.assertRaises(TypeError):
+            canonicalize_axes([0, "1"], 4)
 
 
 class GetOutputShapeGivenTFPaddingTest(test_case.TestCase):
@@ -211,7 +252,7 @@ class GetOutputShapeGivenTFPaddingTest(test_case.TestCase):
     def test_warning_for_inconsistencies(self):
         """Test that a warning is raised for potential inconsistencies"""
         with self.assertWarns(Warning):
-            _convert_conv_tranpose_padding_args_from_keras_to_torch(
+            _convert_conv_transpose_padding_args_from_keras_to_torch(
                 kernel_size=3,
                 stride=2,
                 dilation_rate=1,
@@ -224,7 +265,7 @@ class GetOutputShapeGivenTFPaddingTest(test_case.TestCase):
         (
             torch_padding,
             torch_output_padding,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_torch(
             kernel_size=3,
             stride=2,
             dilation_rate=1,

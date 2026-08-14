@@ -15,6 +15,17 @@ _IMAGE_DATA_FORMAT = "channels_last"
 # Default backend: TensorFlow.
 _BACKEND = "tensorflow"
 
+# Whether NNX is enabled.
+_NNX_ENABLED = False
+
+# Cap run duration for debugging.
+_MAX_EPOCHS = None
+_MAX_STEPS_PER_EPOCH = None
+
+# This flag forces Keras to use backend-agnostic ops even if there is
+# backend-specific implementation available.
+_USE_BACKEND_AGNOSTIC_OPS = False
+
 
 @keras_export(["keras.config.floatx", "keras.backend.floatx"])
 def floatx():
@@ -167,6 +178,91 @@ def set_image_data_format(data_format):
     _IMAGE_DATA_FORMAT = data_format
 
 
+@keras_export("keras.config.enable_flash_attention")
+def enable_flash_attention():
+    """Enable flash attention.
+
+    Flash attention offers performance optimization for attention layers,
+    making it especially useful for large language models (LLMs) that
+    benefit from faster and more memory-efficient attention computations.
+
+    Once enabled, supported layers like `MultiHeadAttention` will **attempt** to
+    use flash attention for faster computations. By default, this feature is
+    enabled.
+
+    Note that enabling flash attention does not guarantee it will always be
+    used. Typically, the inputs must be in `float16` or `bfloat16` dtype, and
+    input layout requirements may vary depending on the backend.
+    """
+    from keras.src.backend.common import global_state
+
+    global_state.set_global_attribute("flash_attention", None)
+
+
+@keras_export("keras.config.disable_flash_attention")
+def disable_flash_attention():
+    """Disable flash attention.
+
+    Flash attention offers performance optimization for attention layers,
+    making it especially useful for large language models (LLMs) that
+    benefit from faster and more memory-efficient attention computations.
+
+    Once disabled, supported layers like `MultiHeadAttention` will not
+    use flash attention for faster computations.
+    """
+    from keras.src.backend.common import global_state
+
+    global_state.set_global_attribute("flash_attention", False)
+
+
+@keras_export("keras.config.is_flash_attention_enabled")
+def is_flash_attention_enabled():
+    """Checks whether flash attention is globally enabled in Keras.
+
+    Flash attention is a performance-optimized method for computing attention
+    in large models, such as transformers, allowing for faster and more
+    memory-efficient operations. This function checks the global Keras
+    configuration to determine if flash attention is enabled for compatible
+    layers (e.g., `MultiHeadAttention`).
+
+    Note that enabling flash attention does not guarantee it will always be
+    used. Typically, the inputs must be in `float16` or `bfloat16` dtype, and
+    input layout requirements may vary depending on the backend.
+
+    Returns:
+        `False` if disabled; otherwise, it indicates that it is enabled.
+    """
+    from keras.src.backend.common import global_state
+
+    return global_state.get_global_attribute("flash_attention", default=None)
+
+
+@keras_export("keras.config.is_nnx_enabled")
+def is_nnx_enabled():
+    """Checks whether NNX specific features are enabled for the JAX backend.
+
+    Returns:
+        bool: `True` if NNX backend features are enabled, `False` otherwise.
+        Defaults to `False`.
+    """
+    return _NNX_ENABLED
+
+
+def set_nnx_enabled(value):
+    global _NNX_ENABLED
+    from keras.src.backend.common import global_state
+
+    _NNX_ENABLED = bool(value)
+    if _NNX_ENABLED:
+        try:
+            from flax import nnx  # noqa F401
+        except ImportError:
+            raise ImportError(
+                "To use NNX with the JAX backend, you must install `flax`."
+            )
+    global_state.set_global_attribute("nnx_enabled", bool(value))
+
+
 def standardize_data_format(data_format):
     if data_format is None:
         return image_data_format()
@@ -205,14 +301,32 @@ if os.path.exists(_config_path):
     except ValueError:
         _config = {}
     _floatx = _config.get("floatx", floatx())
-    assert _floatx in {"float16", "float32", "float64"}
+    if _floatx not in {"float16", "float32", "float64"}:
+        raise ValueError(
+            "Invalid `floatx` configuration. "
+            "Expected one of {'float16', 'float32', 'float64'}. "
+            f"Received: floatx={_floatx}"
+        )
     _epsilon = _config.get("epsilon", epsilon())
-    assert isinstance(_epsilon, float)
+    if not isinstance(_epsilon, float):
+        raise ValueError(
+            "Invalid `epsilon` configuration. "
+            "Expected a float. "
+            f"Received: epsilon={_epsilon}"
+        )
     _backend = _config.get("backend", _BACKEND)
     _image_data_format = _config.get("image_data_format", image_data_format())
-    assert _image_data_format in {"channels_last", "channels_first"}
+    if _image_data_format not in {"channels_last", "channels_first"}:
+        raise ValueError(
+            "Invalid `image_data_format` configuration. "
+            "Expected one of {'channels_last', 'channels_first'}. "
+            f"Received: image_data_format={_image_data_format}"
+        )
+    _nnx_enabled_config = _config.get("nnx_enabled", _NNX_ENABLED)
 
+    # Apply basic configs that don't cause circular import
     set_floatx(_floatx)
+    _NNX_ENABLED = _nnx_enabled_config
     set_epsilon(_epsilon)
     set_image_data_format(_image_data_format)
     _BACKEND = _backend
@@ -245,6 +359,10 @@ if "KERAS_BACKEND" in os.environ:
     _backend = os.environ["KERAS_BACKEND"]
     if _backend:
         _BACKEND = _backend
+if "KERAS_MAX_EPOCHS" in os.environ:
+    _MAX_EPOCHS = int(os.environ["KERAS_MAX_EPOCHS"])
+if "KERAS_MAX_STEPS_PER_EPOCH" in os.environ:
+    _MAX_STEPS_PER_EPOCH = int(os.environ["KERAS_MAX_STEPS_PER_EPOCH"])
 
 
 if _BACKEND != "tensorflow":
@@ -274,3 +392,91 @@ def backend():
 
     """
     return _BACKEND
+
+
+@keras_export(["keras.config.set_max_epochs"])
+def set_max_epochs(max_epochs):
+    """Limit the maximum number of epochs for any call to fit.
+
+    This will cap the number of epochs for any training run using `model.fit()`.
+    This is purely for debugging, and can also be set via the `KERAS_MAX_EPOCHS`
+    environment variable to quickly run a script without modifying its source.
+
+    Args:
+        max_epochs: The integer limit on the number of epochs or `None`. If
+            `None`, no limit is applied.
+    """
+    global _MAX_EPOCHS
+    _MAX_EPOCHS = max_epochs
+
+
+@keras_export(["keras.config.set_max_steps_per_epoch"])
+def set_max_steps_per_epoch(max_steps_per_epoch):
+    """Limit the maximum number of steps for any call to fit/evaluate/predict.
+
+    This will cap the number of steps for single epoch of a call to `fit()`,
+    `evaluate()`, or `predict()`. This is purely for debugging, and can also be
+    set via the `KERAS_MAX_STEPS_PER_EPOCH` environment variable to quickly run
+    a scrip without modifying its source.
+
+    Args:
+        max_epochs: The integer limit on the number of epochs or `None`. If
+            `None`, no limit is applied.
+    """
+    global _MAX_STEPS_PER_EPOCH
+    _MAX_STEPS_PER_EPOCH = max_steps_per_epoch
+
+
+@keras_export(["keras.config.max_epochs"])
+def max_epochs():
+    """Get the maximum number of epochs for any call to fit.
+
+    Retrieves the limit on the number of epochs set by
+    `keras.config.set_max_epochs` or the `KERAS_MAX_EPOCHS` environment
+    variable.
+
+    Returns:
+        The integer limit on the number of epochs or `None`, if no limit has
+        been set.
+    """
+    return _MAX_EPOCHS
+
+
+@keras_export(["keras.config.max_steps_per_epoch"])
+def max_steps_per_epoch():
+    """Get the maximum number of steps for any call to fit/evaluate/predict.
+
+    Retrieves the limit on the number of epochs set by
+    `keras.config.set_max_steps_per_epoch` or the `KERAS_MAX_STEPS_PER_EPOCH`
+    environment variable.
+
+    Args:
+        max_epochs: The integer limit on the number of epochs or `None`. If
+            `None`, no limit is applied.
+    """
+    return _MAX_STEPS_PER_EPOCH
+
+
+if "KERAS_NNX_ENABLED" in os.environ:
+    env_val = os.environ["KERAS_NNX_ENABLED"].lower()
+    if env_val == "true" or env_val == "1":
+        _NNX_ENABLED = True
+    else:
+        _NNX_ENABLED = False
+
+set_nnx_enabled(_NNX_ENABLED)
+
+if "KERAS_USE_BACKEND_AGNOSTIC_OPS" in os.environ:
+    env_val = os.environ["KERAS_USE_BACKEND_AGNOSTIC_OPS"].lower()
+    _USE_BACKEND_AGNOSTIC_OPS = env_val in ("true", "1", "yes")
+
+
+def _use_backend_agnostic_ops():
+    """Returns the flag that checks if backend-agnostic ops are forced."""
+    return _USE_BACKEND_AGNOSTIC_OPS
+
+
+def _set_use_backend_agnostic_ops(value):
+    """Internal helper to force backend-agnostic ops for testing/benchmarks."""
+    global _USE_BACKEND_AGNOSTIC_OPS
+    _USE_BACKEND_AGNOSTIC_OPS = bool(value)

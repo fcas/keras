@@ -1,12 +1,14 @@
 import builtins
 import math
 
+import numpy as np
 import torch
 
 from keras.src.backend import KerasTensor
 from keras.src.backend import config
 from keras.src.backend.common import dtypes
 from keras.src.backend.common.backend_utils import canonicalize_axis
+from keras.src.backend.common.backend_utils import normalize_shift_and_axis
 from keras.src.backend.common.backend_utils import to_tuple_or_list
 from keras.src.backend.common.backend_utils import vectorize_impl
 from keras.src.backend.common.variables import standardize_dtype
@@ -22,6 +24,45 @@ TORCH_INT_TYPES = (
     torch.int32,
     torch.int64,
 )
+
+
+def rot90(array, k=1, axes=(0, 1)):
+    """Rotate an array by 90 degrees in the specified plane using PyTorch.
+
+    Args:
+        array: Input tensor
+        k: Number of 90-degree rotations (default=1)
+        axes: Tuple of two axes that define the
+            plane of rotation (defaults to `(0, 1)`).
+
+    Returns:
+        Rotated tensor
+    """
+    array = convert_to_tensor(array)
+
+    if array.ndim < 2:
+        raise ValueError(
+            "Input array must have at least 2 dimensions. "
+            f"Received: array.ndim={array.ndim}"
+        )
+    if len(axes) != 2 or axes[0] == axes[1]:
+        raise ValueError(
+            f"Invalid axes: {axes}. Axes must be a tuple "
+            "of two different dimensions."
+        )
+
+    axes = tuple(axis if axis >= 0 else array.ndim + axis for axis in axes)
+
+    if not builtins.all(0 <= axis < array.ndim for axis in axes):
+        raise ValueError(
+            f"Invalid axes {axes} for tensor with {array.ndim} dimensions"
+        )
+
+    rotated = torch.rot90(array, k=k, dims=axes)
+    if isinstance(array, np.ndarray):
+        rotated = rotated.cpu().numpy()
+
+    return rotated
 
 
 def add(x1, x2):
@@ -60,6 +101,8 @@ def subtract(x1, x2):
 def matmul(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
+    x1_dtype = standardize_dtype(x1.dtype)
+    x2_dtype = standardize_dtype(x2.dtype)
 
     def can_use_int_matmul(x1, x2):
         # torch._int_mm only accepts the following conditions:
@@ -70,8 +113,6 @@ def matmul(x1, x2):
         # 5. x2.shape must be [>= 16 and a multiplier of 8, multiplier of 8]
         if get_device() != "cuda":
             return False
-        x1_dtype = standardize_dtype(x1.dtype)
-        x2_dtype = standardize_dtype(x2.dtype)
         if x1_dtype != "int8" or x2_dtype != "int8":
             return False
         x1_shape = x1.shape
@@ -87,11 +128,14 @@ def matmul(x1, x2):
     # Shortcut for torch._int_mm
     # TODO: Loosen the restriction of the usage of torch._int_mm
     # TODO: We should replace torch._int_mm with the public api if possible
+    # Not yet supported with CUDA 13 without `use_transpose`
+    # https://github.com/pytorch/pytorch/blob/main/test/test_linalg.py#L7876
     if can_use_int_matmul(x1, x2):
-        return torch._int_mm(x1, x2)
+        try:
+            return torch._int_mm(x1, x2)
+        except RuntimeError:
+            pass
 
-    x1_dtype = standardize_dtype(x1.dtype)
-    x2_dtype = standardize_dtype(x2.dtype)
     if x1_dtype == "int8" and x2_dtype == "int8":
         result_dtype = "int32"
     else:
@@ -146,12 +190,11 @@ def mean(x, axis=None, keepdims=False):
     # delimiter in the overloaded method signatures.
     # Additionally, we have to create a singleton-tuple
     # when `axis` is an int to match the existing fn signature
-    result = torch.mean(
-        x,
-        axis,
-        keepdims,
-        dtype=to_torch_dtype(compute_dtype),
-    )
+
+    # Cast input to compute dtype before mean to avoid dtype kwarg
+    # which causes issues with ONNX export (dtype kwarg not supported)
+    x = cast(x, compute_dtype)
+    result = torch.mean(x, axis, keepdims)
     return cast(result, result_dtype)
 
 
@@ -213,26 +256,43 @@ def abs(x):
     return absolute(x)
 
 
+def fabs(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    if "int" in dtype or dtype == "bool":
+        x = cast(x, config.floatx())
+    return torch.abs(x)
+
+
 def all(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    if axis is None:
-        return cast(torch.all(x), "bool")
     axis = to_tuple_or_list(axis)
-    for a in axis:
-        # `torch.all` does not handle multiple axes.
-        x = torch.all(x, dim=a, keepdim=keepdims)
-    return cast(x, "bool")
+    if axis == () or axis == []:
+        return cast(x, "bool")
+    if isinstance(axis, list):
+        axis = tuple(axis)
+    return cast(torch.all(x, dim=axis, keepdim=keepdims), "bool")
+
+
+def angle(x):
+    x = convert_to_tensor(x)
+    ori_dtype = standardize_dtype(x.dtype)
+
+    # torch.angle doesn't support float16 with cuda
+    if get_device() != "cpu" and ori_dtype == "float16":
+        x = cast(x, "float32")
+        return cast(torch.angle(x), "float16")
+    return torch.angle(x)
 
 
 def any(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    if axis is None:
-        return cast(torch.any(x), "bool")
     axis = to_tuple_or_list(axis)
-    for a in axis:
-        # `torch.any` does not handle multiple axes.
-        x = torch.any(x, dim=a, keepdim=keepdims)
-    return cast(x, "bool")
+    if axis == () or axis == []:
+        return cast(x, "bool")
+    if isinstance(axis, list):
+        axis = tuple(axis)
+    return cast(torch.any(x, dim=axis, keepdim=keepdims), "bool")
 
 
 def amax(x, axis=None, keepdims=False):
@@ -262,18 +322,19 @@ def append(x1, x2, axis=None):
     return torch.cat((x1, x2), dim=axis)
 
 
-def arange(start, stop=None, step=1, dtype=None):
+def arange(start, stop=None, step=None, dtype=None):
     if dtype is None:
-        dtypes_to_resolve = [
-            getattr(start, "dtype", type(start)),
-            getattr(step, "dtype", type(step)),
-        ]
+        dtypes_to_resolve = [getattr(start, "dtype", type(start))]
         if stop is not None:
             dtypes_to_resolve.append(getattr(stop, "dtype", type(stop)))
+        if step is not None:
+            dtypes_to_resolve.append(getattr(step, "dtype", type(step)))
         dtype = dtypes.result_type(*dtypes_to_resolve)
     dtype = to_torch_dtype(dtype)
     if stop is None:
-        return torch.arange(end=start, dtype=dtype, device=get_device())
+        start, stop = 0, start
+    if step is None:
+        step = 1
     return torch.arange(
         start, stop, step=step, dtype=dtype, device=get_device()
     )
@@ -359,11 +420,42 @@ def array(x, dtype=None):
     return convert_to_tensor(x, dtype=dtype)
 
 
+def view(x, dtype=None):
+    dtype = to_torch_dtype(dtype)
+    x = convert_to_tensor(x)
+    return x.view(dtype=dtype)
+
+
 def average(x, axis=None, weights=None):
     x = convert_to_tensor(x)
     dtypes_to_resolve = [x.dtype, float]
     if weights is not None:
         weights = convert_to_tensor(weights)
+        if len(weights.shape) == 1 and len(x.shape) > 1:
+            if axis is None or (
+                isinstance(axis, (list, tuple)) and len(axis) != 1
+            ):
+                raise ValueError(
+                    "Axis must be specified when shapes of a and weights "
+                    "differ."
+                )
+            axis_val = axis[0] if isinstance(axis, (list, tuple)) else axis
+            axis_val = canonicalize_axis(axis_val, len(x.shape))
+            if weights.shape[0] != x.shape[axis_val]:
+                raise ValueError(
+                    "Shape of weights must be consistent with shape of a "
+                    "along specified axis."
+                )
+        elif x.shape != weights.shape:
+            if axis is None:
+                raise ValueError(
+                    "Axis must be specified when shapes of a and weights "
+                    "differ."
+                )
+            raise ValueError(
+                "Shape of weights must be consistent with shape of a "
+                "along specified axis."
+            )
         dtypes_to_resolve.append(weights.dtype)
     dtype = dtypes.result_type(*dtypes_to_resolve)
     x = cast(x, dtype)
@@ -373,10 +465,56 @@ def average(x, axis=None, weights=None):
         # Torch handles the empty axis case differently from numpy.
         return x
     if weights is not None:
-        return torch.sum(torch.mul(x, weights), dim=axis) / torch.sum(
-            weights, dim=-1
-        )
+        if len(weights.shape) == 1 and len(x.shape) > 1 and axis is not None:
+            a = axis[0] if isinstance(axis, (tuple, list)) else axis
+            if isinstance(a, int):
+                a = a if a >= 0 else len(x.shape) + a
+                w_shape = [1] * len(x.shape)
+                w_shape[a] = weights.shape[0]
+                weights = torch.reshape(weights, w_shape)
+
+        if axis is not None:
+            return torch.sum(torch.mul(x, weights), dim=axis) / torch.sum(
+                weights, dim=axis
+            )
+        return torch.sum(torch.mul(x, weights)) / torch.sum(weights)
     return torch.mean(x, axis)
+
+
+def bartlett(x):
+    x = convert_to_tensor(x)
+    return torch.signal.windows.bartlett(x)
+
+
+def hamming(x):
+    x = convert_to_tensor(x)
+    return torch.signal.windows.hamming(x)
+
+
+def hanning(x):
+    x = convert_to_tensor(x)
+    return torch.signal.windows.hann(x)
+
+
+def heaviside(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    if dtype in ["int8", "int16", "int32", "uint8", "uint16", "uint32"]:
+        dtype = config.floatx()
+    elif dtype == "int64":
+        dtype = "float64"
+
+    x1 = cast(x1, dtype)
+    x2 = cast(x2, dtype)
+
+    return torch.heaviside(x1, x2)
+
+
+def kaiser(x, beta):
+    x = convert_to_tensor(x)
+    return torch.signal.windows.kaiser(x, beta=beta)
 
 
 def bincount(x, weights=None, minlength=0, sparse=False):
@@ -410,9 +548,75 @@ def bincount(x, weights=None, minlength=0, sparse=False):
     return cast(torch.bincount(x, weights, minlength), dtype)
 
 
+def bitwise_and(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    return torch.bitwise_and(x, y)
+
+
+def bitwise_invert(x):
+    x = convert_to_tensor(x)
+    return torch.bitwise_not(x)
+
+
+def bitwise_not(x):
+    return bitwise_invert(x)
+
+
+def bitwise_or(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    return torch.bitwise_or(x, y)
+
+
+def bitwise_xor(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    return torch.bitwise_xor(x, y)
+
+
+def bitwise_left_shift(x, y):
+    x = convert_to_tensor(x)
+    if not isinstance(y, int):
+        y = convert_to_tensor(y)
+    return torch.bitwise_left_shift(x, y)
+
+
+def left_shift(x, y):
+    return bitwise_left_shift(x, y)
+
+
+def bitwise_right_shift(x, y):
+    x = convert_to_tensor(x)
+    if not isinstance(y, int):
+        y = convert_to_tensor(y)
+    return torch.bitwise_right_shift(x, y)
+
+
+def right_shift(x, y):
+    return bitwise_right_shift(x, y)
+
+
+def blackman(x):
+    x = convert_to_tensor(x)
+    return torch.signal.windows.blackman(x)
+
+
 def broadcast_to(x, shape):
     x = convert_to_tensor(x)
     return torch.broadcast_to(x, shape)
+
+
+def cbrt(x):
+    x = convert_to_tensor(x)
+
+    dtype = standardize_dtype(x.dtype)
+    if dtype == "bool":
+        x = cast(x, "int32")
+    elif dtype == "int64":
+        x = cast(x, "float64")
+
+    return torch.sign(x) * torch.abs(x) ** (1.0 / 3.0)
 
 
 def ceil(x):
@@ -489,7 +693,7 @@ def count_nonzero(x, axis=None):
     return cast(torch.count_nonzero(x, dim=axis).T, "int32")
 
 
-def cross(x1, x2, axisa=-1, axisb=-1, axisc=-1, axis=-1):
+def cross(x1, x2, axisa=-1, axisb=-1, axisc=-1, axis=None):
     if axisa != -1 or axisb != -1 or axisc != -1:
         raise ValueError(
             "Torch backend does not support `axisa`, `axisb`, or `axisc`. "
@@ -508,7 +712,10 @@ def cross(x1, x2, axisa=-1, axisb=-1, axisc=-1, axis=-1):
         compute_dtype = "float32"
     x1 = cast(x1, compute_dtype)
     x2 = cast(x2, compute_dtype)
-    return cast(torch.cross(x1, x2, dim=axis), result_dtype)
+    if axis is None:
+        # match numpy default (last axis)
+        axis = -1
+    return cast(torch.linalg.cross(x1, x2, dim=axis), result_dtype)
 
 
 def cumprod(x, axis=None, dtype=None):
@@ -545,9 +752,32 @@ def cumsum(x, axis=None, dtype=None):
     return torch.cumsum(x, dim=axis, dtype=to_torch_dtype(dtype))
 
 
+def deg2rad(x):
+    x = convert_to_tensor(x)
+
+    if standardize_dtype(x.dtype) == "int64":
+        return cast(torch.deg2rad(x), "float64")
+
+    return torch.deg2rad(x)
+
+
+def rad2deg(x):
+    x = convert_to_tensor(x)
+
+    if standardize_dtype(x.dtype) == "int64":
+        return cast(torch.rad2deg(x), "float64")
+
+    return torch.rad2deg(x)
+
+
 def diag(x, k=0):
     x = convert_to_tensor(x)
     return torch.diag(x, diagonal=k)
+
+
+def diagflat(x, k=0):
+    x = convert_to_tensor(x)
+    return torch.diagflat(x, offset=k)
 
 
 def diagonal(x, offset=0, axis1=0, axis2=1):
@@ -573,10 +803,10 @@ def digitize(x, bins):
     return cast(torch.bucketize(x, bins, right=True), "int32")
 
 
-def dot(x, y):
-    x = convert_to_tensor(x)
-    y = convert_to_tensor(y)
-    result_dtype = dtypes.result_type(x.dtype, y.dtype)
+def dot(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
     # GPU only supports float types
     compute_dtype = dtypes.result_type(result_dtype, float)
 
@@ -584,16 +814,32 @@ def dot(x, y):
     if get_device() == "cpu" and compute_dtype == "float16":
         compute_dtype = "float32"
 
-    x = cast(x, compute_dtype)
-    y = cast(y, compute_dtype)
-    if x.ndim == 0 or y.ndim == 0:
-        return cast(torch.multiply(x, y), result_dtype)
-    return cast(torch.matmul(x, y), result_dtype)
+    x1 = cast(x1, compute_dtype)
+    x2 = cast(x2, compute_dtype)
+    if x1.ndim == 0 or x2.ndim == 0:
+        return cast(torch.multiply(x1, x2), result_dtype)
+    if x2.ndim >= 2:
+        return cast(
+            torch.tensordot(x1, x2, dims=([x1.ndim - 1], [x2.ndim - 2])),
+            result_dtype,
+        )
+    return cast(torch.matmul(x1, x2), result_dtype)
+
+
+def dstack(xs):
+    xs = [convert_to_tensor(x) for x in xs]
+    return torch.dstack(xs)
 
 
 def empty(shape, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     return torch.empty(size=shape, dtype=dtype, device=get_device())
+
+
+def empty_like(x, dtype=None):
+    x = convert_to_tensor(x)
+    dtype = to_torch_dtype(dtype or x.dtype)
+    return torch.empty_like(x, dtype=dtype, device=get_device())
 
 
 def equal(x1, x2):
@@ -607,6 +853,14 @@ def exp(x):
     if "int" in ori_dtype or ori_dtype == "bool":
         x = cast(x, config.floatx())
     return torch.exp(x)
+
+
+def exp2(x):
+    x = convert_to_tensor(x)
+    ori_dtype = standardize_dtype(x.dtype)
+    if "int" in ori_dtype or ori_dtype == "bool":
+        x = cast(x, config.floatx())
+    return torch.exp2(x)
 
 
 def expand_dims(x, axis):
@@ -633,6 +887,16 @@ def flip(x, axis=None):
         axis = tuple(range(x.ndim))
     axis = to_tuple_or_list(axis)
     return torch.flip(x, dims=axis)
+
+
+def fliplr(x):
+    x = convert_to_tensor(x)
+    return torch.fliplr(x)
+
+
+def flipud(x):
+    x = convert_to_tensor(x)
+    return torch.flipud(x)
 
 
 def floor(x):
@@ -664,6 +928,39 @@ def full_like(x, fill_value, dtype=None):
     return full(shape=x.shape, fill_value=fill_value, dtype=dtype)
 
 
+def gcd(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return torch.gcd(x1, x2)
+
+
+def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
+    if axis != 0:
+        raise ValueError(
+            "torch does not support an `axis` argument for geomspace. "
+            f"Received axis={axis}"
+        )
+    if dtype is None:
+        dtypes_to_resolve = [
+            getattr(start, "dtype", type(start)),
+            getattr(stop, "dtype", type(stop)),
+            float,
+        ]
+        dtype = dtypes.result_type(*dtypes_to_resolve)
+    dtype = to_torch_dtype(dtype)
+
+    start = convert_to_tensor(start, dtype=dtype)
+    stop = convert_to_tensor(stop, dtype=dtype)
+
+    log_start = torch.log10(torch.abs(start))
+    log_stop = torch.log10(torch.abs(stop))
+
+    result = logspace(
+        log_start, log_stop, num=num, endpoint=endpoint, base=10, dtype=dtype
+    )
+    return result * torch.sign(start)
+
+
 def greater(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
     return torch.greater(x1, x2)
@@ -677,6 +974,29 @@ def greater_equal(x1, x2):
 def hstack(xs):
     xs = [convert_to_tensor(x) for x in xs]
     return torch.hstack(xs)
+
+
+def hsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    if not isinstance(indices_or_sections, int):
+        indices_or_sections = convert_to_tensor(indices_or_sections).tolist()
+    return list(torch.hsplit(x, indices_or_sections))
+
+
+def hypot(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    if dtype in ["int8", "int16", "int32", "uint8", "uint16", "uint32"]:
+        dtype = config.floatx()
+    elif dtype == "int64":
+        dtype = "float64"
+
+    x1 = cast(x1, dtype)
+    x2 = cast(x2, dtype)
+
+    return torch.hypot(x1, x2)
 
 
 def identity(n, dtype=None):
@@ -697,18 +1017,61 @@ def imag(x):
     return torch.imag(x)
 
 
-def isclose(x1, x2):
+def i0(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    if dtype in ["int64", "float64"]:
+        dtype = "float64"
+    elif dtype not in ["bfloat16", "float16"]:
+        dtype = config.floatx()
+    x = cast(x, dtype)
+    return torch.i0(x)
+
+
+def isclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
     result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
     x1 = cast(x1, result_dtype)
     x2 = cast(x2, result_dtype)
-    return torch.isclose(x1, x2)
+    if "float" in standardize_dtype(result_dtype):
+        return torch.isclose(x1, x2, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    return torch.eq(x1, x2)
+
+
+def allclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    x1 = cast(x1, result_dtype)
+    x2 = cast(x2, result_dtype)
+    if "float" in standardize_dtype(result_dtype):
+        return torch.all(
+            torch.isclose(x1, x2, rtol=rtol, atol=atol, equal_nan=equal_nan)
+        )
+    return torch.all(torch.eq(x1, x2))
 
 
 def isfinite(x):
     x = convert_to_tensor(x)
     return torch.isfinite(x)
+
+
+def isin(x1, x2, assume_unique=False, invert=False):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    if dtype == "bool":
+        x1 = cast(x1, "int32")
+        x2 = cast(x2, "int32")
+
+    if standardize_dtype(x1.dtype) == "bool":
+        x1 = cast(x1, x2.dtype)
+    if standardize_dtype(x2.dtype) == "bool":
+        x2 = cast(x2, x1.dtype)
+
+    return torch.isin(x1, x2, assume_unique=assume_unique, invert=invert)
 
 
 def isinf(x):
@@ -719,6 +1082,47 @@ def isinf(x):
 def isnan(x):
     x = convert_to_tensor(x)
     return torch.isnan(x)
+
+
+def isneginf(x):
+    x = convert_to_tensor(x)
+    return torch.isneginf(x)
+
+
+def isposinf(x):
+    x = convert_to_tensor(x)
+    return torch.isposinf(x)
+
+
+def isreal(x):
+    x = convert_to_tensor(x)
+    return torch.isreal(x)
+
+
+def kron(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return torch.kron(x1, x2)
+
+
+def lcm(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return torch.lcm(x1, x2)
+
+
+def ldexp(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+
+    if standardize_dtype(x2.dtype) not in dtypes.INT_TYPES:
+        raise TypeError(
+            f"ldexp exponent must be an integer type. "
+            f"Received: x2 dtype={x2.dtype}"
+        )
+
+    return cast(torch.ldexp(x1, x2), dtype)
 
 
 def less(x1, x2):
@@ -817,6 +1221,15 @@ def logaddexp(x1, x2):
         return torch.logaddexp(x1, x2)
 
 
+def logaddexp2(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+    x1 = cast(x1, dtype)
+    x2 = cast(x2, dtype)
+    return torch.logaddexp2(x1, x2)
+
+
 def logical_and(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
     return torch.logical_and(x1, x2)
@@ -894,46 +1307,28 @@ def maximum(x1, x2):
     return torch.maximum(x1, x2)
 
 
+def fmax(x1, x2):
+    if not isinstance(x1, (int, float)):
+        x1 = convert_to_tensor(x1)
+    if not isinstance(x2, (int, float)):
+        x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(
+        getattr(x1, "dtype", type(x1)),
+        getattr(x2, "dtype", type(x2)),
+    )
+    x1 = convert_to_tensor(x1, dtype)
+    x2 = convert_to_tensor(x2, dtype)
+    return torch.fmax(x1, x2)
+
+
 def median(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
-    compute_dtype = dtypes.result_type(x.dtype, "float32")
-    result_dtype = dtypes.result_type(x.dtype, float)
-    x = cast(x, compute_dtype)
 
-    if axis is None and keepdims is False:
-        return cast(torch.median(x), result_dtype)
-    elif isinstance(axis, int):
-        return cast(
-            torch.median(x, dim=axis, keepdim=keepdims)[0], result_dtype
-        )
-
-    # support multiple axes
-    if axis is None:
-        y = reshape(x, [-1])
-    else:
-        # transpose
-        axis = [canonicalize_axis(a, x.ndim) for a in axis]
-        other_dims = sorted(set(range(x.ndim)).difference(axis))
-        perm = other_dims + list(axis)
-        x_permed = torch.permute(x, dims=perm)
-        # reshape
-        x_shape = list(x.shape)
-        other_shape = [x_shape[i] for i in other_dims]
-        end_shape = [math.prod([x_shape[i] for i in axis])]
-        full_shape = other_shape + end_shape
-        y = reshape(x_permed, full_shape)
-
-    y = torch.median(y, dim=-1)[0]
-
-    if keepdims:
-        if axis is None:
-            for _ in range(x.ndim):
-                y = expand_dims(y, axis=-1)
-        else:
-            for i in sorted(axis):
-                y = expand_dims(y, axis=i)
-
-    return cast(y, result_dtype)
+    # `torch.median` returns the lower of the two middle values for an
+    # even-length reduction, whereas numpy and the other backends average
+    # them. Delegate to `quantile(q=0.5)`, which averages (and returns a
+    # float result, including for an empty `axis`), matching numpy.
+    return quantile(x, q=0.5, axis=axis, keepdims=keepdims)
 
 
 def meshgrid(*x, indexing="xy"):
@@ -980,6 +1375,20 @@ def minimum(x1, x2):
     return torch.minimum(x1, x2)
 
 
+def fmin(x1, x2):
+    if not isinstance(x1, (int, float)):
+        x1 = convert_to_tensor(x1)
+    if not isinstance(x2, (int, float)):
+        x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(
+        getattr(x1, "dtype", type(x1)),
+        getattr(x2, "dtype", type(x2)),
+    )
+    x1 = convert_to_tensor(x1, dtype)
+    x2 = convert_to_tensor(x2, dtype)
+    return torch.fmin(x1, x2)
+
+
 def mod(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -990,9 +1399,221 @@ def mod(x1, x2):
     return torch.remainder(x1, x2)
 
 
+def fmod(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    if dtype == "bool":
+        x1 = cast(x1, "int32")
+        x2 = cast(x2, "int32")
+    return torch.fmod(x1, x2)
+
+
 def moveaxis(x, source, destination):
     x = convert_to_tensor(x)
     return torch.moveaxis(x, source=source, destination=destination)
+
+
+def nanargmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if not torch.is_floating_point(x):
+        return argmax(x, axis=axis, keepdims=keepdims)
+
+    x_clean = torch.where(torch.isnan(x), float("-inf"), x)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(-1, dtype=torch.int32, device=get_device()),
+        argmax(x_clean, axis=axis, keepdims=keepdims),
+    )
+
+
+def nanargmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if not torch.is_floating_point(x):
+        return argmin(x, axis=axis, keepdims=keepdims)
+
+    x_clean = torch.where(torch.isnan(x), float("inf"), x)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(-1, dtype=torch.int32, device=get_device()),
+        argmin(x_clean, axis=axis, keepdims=keepdims),
+    )
+
+
+def nancumsum(x, axis=None, dtype=None):
+    x = nan_to_num(x, posinf=float("inf"), neginf=float("-inf"))
+    return cumsum(x, axis=axis, dtype=dtype)
+
+
+def nancumprod(x, axis=None, dtype=None):
+    x = nan_to_num(x, nan=1.0, posinf=float("inf"), neginf=float("-inf"))
+    return cumprod(x, axis=axis, dtype=dtype)
+
+
+def nanmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    if not torch.is_floating_point(x):
+        return torch.amax(x, dim=axis, keepdim=keepdims)
+
+    if axis == () or axis == []:
+        return x
+
+    x_clean = torch.where(torch.isnan(x), float("-inf"), x)
+    out = torch.amax(x_clean, dim=axis, keepdim=keepdims)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(float("nan"), dtype=x.dtype, device=get_device()),
+        out,
+    )
+
+
+def nanmean(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    dtype = dtypes.result_type(standardize_dtype(x.dtype), float)
+    return torch.nanmean(cast(x, dtype), dim=axis, keepdim=keepdims)
+
+
+def nanmedian(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    return nanquantile(x, q=0.5, axis=axis, keepdims=keepdims)
+
+
+def nanmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    if not torch.is_floating_point(x):
+        return torch.amin(x, dim=axis, keepdim=keepdims)
+
+    if axis == () or axis == []:
+        return x
+
+    x_clean = torch.where(torch.isnan(x), float("inf"), x)
+    out = torch.amin(x_clean, dim=axis, keepdim=keepdims)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(float("nan"), dtype=x.dtype, device=get_device()),
+        out,
+    )
+
+
+def nanpercentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q, dtype=config.floatx()) / 100.0
+    return nanquantile(x, q, axis=axis, method=method, keepdims=keepdims)
+
+
+def nanprod(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return torch.nan_to_num(x, nan=1)
+
+    if isinstance(axis, (list, tuple)):
+        axis = sorted(axis, reverse=True)
+
+    if not torch.is_floating_point(x):
+        return prod(x, axis=axis, keepdims=keepdims)
+
+    return prod(
+        torch.where(torch.isnan(x), torch.ones((), dtype=x.dtype), x),
+        axis=axis,
+        keepdims=keepdims,
+    )
+
+
+def nanquantile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q)
+    axis = to_tuple_or_list(axis)
+
+    compute_dtype = dtypes.result_type(x.dtype, "float32")
+    result_dtype = dtypes.result_type(x.dtype, float)
+
+    x = cast(x, compute_dtype)
+    if x.dtype != q.dtype:
+        q = cast(q, x.dtype)
+
+    if axis is None:
+        y = reshape(x, [-1])
+    else:
+        axis = [canonicalize_axis(a, x.ndim) for a in axis]
+        other_dims = sorted(set(range(x.ndim)).difference(axis))
+        x_permed = torch.permute(x, dims=(other_dims + list(axis)))
+
+        x_shape = list(x.shape)
+        other_shape = [x_shape[i] for i in other_dims]
+        end_shape = [math.prod([x_shape[i] for i in axis])]
+        full_shape = other_shape + end_shape
+        y = reshape(x_permed, full_shape)
+
+    y = torch.nanquantile(y, q, dim=-1, interpolation=method)
+
+    if keepdims:
+        if axis is None:
+            for _ in range(x.ndim):
+                y = expand_dims(y, axis=-1)
+        else:
+            for i in sorted(axis):
+                i = i + 1 if q.ndim > 0 else i
+                y = expand_dims(y, axis=i)
+
+    return cast(y, result_dtype)
+
+
+def nanstd(x, axis=None, keepdims=False):
+    var_val = nanvar(x, axis=axis, keepdims=keepdims)
+    return torch.sqrt(var_val)
+
+
+def nansum(x, axis=None, keepdims=False):
+    if isinstance(x, (list, tuple)):
+        x = stack(x)
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+
+    if dtype in ("bool", "uint8", "int8", "int16"):
+        dtype = "int32"
+
+    if axis == () or axis == []:
+        return cast(torch.nan_to_num(x, nan=0), dtype)
+    return cast(torch.nansum(x, dim=axis, keepdim=keepdims), dtype)
+
+
+def nanvar(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    result_dtype = dtypes.result_type(x.dtype, float)
+    x = cast(x, result_dtype)
+
+    if axis == () or axis == []:
+        return torch.where(torch.isnan(x), x, torch.zeros(()))
+
+    mean = nanmean(x, axis=axis, keepdims=True)
+
+    valid = ~torch.isnan(x)
+    centered = torch.where(valid, x - mean, torch.zeros_like(x))
+
+    if torch.is_complex(centered):
+        centered = centered.real * centered.real + centered.imag * centered.imag
+    else:
+        centered = centered.square()
+
+    count = valid.sum(dim=axis, keepdim=keepdims)
+    var = centered.sum(dim=axis, keepdim=keepdims) / count
+    return var
 
 
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
@@ -1007,7 +1628,7 @@ def ndim(x):
 
 def nonzero(x):
     x = convert_to_tensor(x)
-    return tuple(cast(indices, "int32") for indices in torch.nonzero(x).T)
+    return cast(torch.nonzero(x).T, "int32")
 
 
 def not_equal(x1, x2):
@@ -1037,6 +1658,22 @@ def pad(x, pad_width, mode="constant", constant_values=None):
             )
         kwargs["value"] = constant_values
     x = convert_to_tensor(x)
+    if mode == "symmetric":
+        # torch has no "symmetric" pad, so mirror manually (including the edge
+        # value). `replicate` only repeats the edge and is numpy's "edge" mode.
+        pw = list(pad_width)
+        if len(pw) == 1:
+            pw = pw * x.ndim
+        for axis, (left, right) in enumerate(pw):
+            if left == 0 and right == 0:
+                continue
+            size = x.shape[axis]
+            period = 2 * size
+            pos = torch.arange(-left, size + right, device=x.device)
+            m = torch.remainder(pos, period)
+            idx = torch.where(m < size, m, period - 1 - m)
+            x = torch.index_select(x, axis, idx)
+        return x
     pad_sum = []
     pad_width = list(pad_width)[::-1]  # torch uses reverse order
     pad_width_sum = 0
@@ -1047,8 +1684,6 @@ def pad(x, pad_width, mode="constant", constant_values=None):
         pad_width_sum -= pad[0] + pad[1]
         if pad_width_sum == 0:  # early break when no padding in higher order
             break
-    if mode == "symmetric":
-        mode = "replicate"
     if mode == "constant":
         return torch.nn.functional.pad(x, pad=pad_sum, mode=mode, **kwargs)
     # TODO: reflect and symmetric padding are implemented for padding the
@@ -1076,6 +1711,12 @@ def pad(x, pad_width, mode="constant", constant_values=None):
     return x
 
 
+def percentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q, dtype=config.floatx()) / 100.0
+    return quantile(x, q, axis=axis, method=method, keepdims=keepdims)
+
+
 def prod(x, axis=None, keepdims=False, dtype=None):
     x = convert_to_tensor(x)
     if dtype is None:
@@ -1094,7 +1735,8 @@ def prod(x, axis=None, keepdims=False, dtype=None):
     if axis is None:
         return cast(torch.prod(x, dtype=to_torch_dtype(compute_dtype)), dtype)
     axis = to_tuple_or_list(axis)
-    for a in axis:
+    axis = [canonicalize_axis(a, x.ndim) for a in axis]
+    for a in sorted(axis, reverse=True):
         # `torch.prod` does not handle multiple axes.
         x = cast(
             torch.prod(
@@ -1103,6 +1745,18 @@ def prod(x, axis=None, keepdims=False, dtype=None):
             dtype,
         )
     return x
+
+
+def ptp(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    if axis is None:
+        return x.max() - x.min()
+    elif axis == ():
+        return torch.zeros_like(x)
+    else:
+        return torch.amax(x, dim=axis, keepdim=keepdims) - torch.amin(
+            x, dim=axis, keepdim=keepdims
+        )
 
 
 def quantile(x, q, axis=None, method="linear", keepdims=False):
@@ -1153,6 +1807,14 @@ def ravel(x):
     return torch.ravel(x)
 
 
+def unravel_index(indices, shape):
+    indices = convert_to_tensor(indices)
+    dtype = dtypes.result_type(indices.dtype)
+    return tuple(
+        cast(idx, dtype) for idx in torch.unravel_index(indices, shape)
+    )
+
+
 def real(x):
     if not isinstance(x, torch.Tensor):
         x = torch.from_numpy(x)  # needed for complex type conversion
@@ -1177,6 +1839,34 @@ def repeat(x, repeats, axis=None):
             device=get_device(),
         )
 
+    # When repeats is a scalar int and axis is specified, use
+    # unsqueeze + expand + reshape instead of repeat_interleave.
+    # repeat_interleave introduces unbacked symbolic integers during
+    # torch.export tracing, preventing static shape inference. This
+    # alternative preserves static output shapes.
+    if isinstance(repeats, int) and axis is not None:
+        if axis < 0:
+            axis = x.ndim + axis
+        shape = list(x.shape)
+        x = x.unsqueeze(axis + 1)
+        expand_shape = [-1] * x.ndim
+        expand_shape[axis + 1] = repeats
+        x = x.expand(expand_shape)
+        new_shape = list(shape)
+        new_shape[axis] = shape[axis] * repeats
+        return x.reshape(new_shape)
+
+    # When repeats is a list/tuple of ints, pass it directly to
+    # repeat_interleave without converting to a tensor. The output
+    # size (sum(repeats)) is statically known, so torch.export can
+    # infer shapes without introducing unbacked symbols.
+    if (
+        isinstance(repeats, (list, tuple))
+        and all(isinstance(r, int) for r in repeats)
+        and axis is not None
+    ):
+        return torch.repeat_interleave(x, repeats, dim=axis)
+
     repeats = convert_to_tensor(repeats, dtype=int)
 
     return torch.repeat_interleave(x, repeats, dim=axis)
@@ -1191,7 +1881,26 @@ def reshape(x, newshape):
 
 def roll(x, shift, axis=None):
     x = convert_to_tensor(x)
-    return torch.roll(x, shift, dims=axis)
+    if axis is not None:
+        # `torch.roll` requires `shifts` and `dims` to have the same length,
+        # while numpy broadcasts them against each other.
+        shifts, axes = normalize_shift_and_axis(shift, axis)
+        return torch.roll(x, tuple(shifts), dims=tuple(axes))
+    return torch.roll(x, shift)
+
+
+def searchsorted(sorted_sequence, values, side="left"):
+    if ndim(sorted_sequence) != 1:
+        raise ValueError(
+            "`searchsorted` only supports 1-D sorted sequences. "
+            "You can use `keras.ops.vectorized_map` "
+            "to extend it to N-D sequences. Received: "
+            f"sorted_sequence.shape={sorted_sequence.shape}"
+        )
+    out_int32 = sorted_sequence.shape[0] <= np.iinfo(np.int32).max
+    return torch.searchsorted(
+        sorted_sequence, values, side=side, out_int32=out_int32
+    )
 
 
 def sign(x):
@@ -1199,9 +1908,19 @@ def sign(x):
     return torch.sign(x)
 
 
+def signbit(x):
+    x = convert_to_tensor(x)
+    return torch.signbit(x)
+
+
 def sin(x):
     x = convert_to_tensor(x)
     return torch.sin(x)
+
+
+def sinc(x):
+    x = convert_to_tensor(x)
+    return torch.sinc(x)
 
 
 def sinh(x):
@@ -1216,6 +1935,9 @@ def size(x):
 
 def sort(x, axis=-1):
     x = convert_to_tensor(x)
+    if axis is None:
+        x = x.reshape(-1)
+        axis = 0
     # TODO: torch.sort doesn't support bool with cuda
     if get_device() == "cuda" and standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
@@ -1252,6 +1974,12 @@ def split(x, indices_or_sections, axis=0):
     )
     if dim == 0 and isinstance(indices_or_sections, int):
         out = [out[0].clone() for _ in range(indices_or_sections)]
+    return list(out)
+
+
+def array_split(x, indices_or_sections, axis=0):
+    x = convert_to_tensor(x)
+    out = torch.tensor_split(x, indices_or_sections, dim=axis)
     return list(out)
 
 
@@ -1359,15 +2087,18 @@ def round(x, decimals=0):
 def tile(x, repeats):
     if is_tensor(repeats):
         repeats = tuple(repeats.int().numpy())
+    if isinstance(repeats, int):
+        repeats = (repeats,)
     x = convert_to_tensor(x)
     return torch.tile(x, dims=repeats)
 
 
-def trace(x, offset=None, axis1=None, axis2=None):
+def trace(x, offset=0, axis1=0, axis2=1):
     x = convert_to_tensor(x)
     dtype = standardize_dtype(x.dtype)
-    if dtype != "int64":
-        dtype = dtypes.result_type(dtype, "int32")
+    if dtype in ("bool", "int8", "int16", "uint8"):
+        # Torch backend doesn't support uint32 dtype.
+        dtype = "int32"
     return torch.sum(
         torch.diagonal(x, offset, axis1, axis2),
         dim=-1,
@@ -1392,6 +2123,13 @@ def triu(x, k=0):
     return torch.triu(x, diagonal=k)
 
 
+def trunc(x):
+    x = convert_to_tensor(x)
+    if standardize_dtype(x.dtype) == "bool":
+        return x
+    return torch.trunc(x)
+
+
 def vdot(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -1408,9 +2146,30 @@ def vdot(x1, x2):
     return cast(torch.vdot(x1, x2), result_dtype)
 
 
+def inner(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    result_dtype = dtypes.result_type(x1.dtype, x2.dtype)
+    compute_dtype = dtypes.result_type(result_dtype, float)
+
+    if get_device() == "cpu" and compute_dtype == "float16":
+        compute_dtype = "float32"
+
+    x1 = cast(x1, compute_dtype)
+    x2 = cast(x2, compute_dtype)
+    return cast(torch.inner(x1, x2), result_dtype)
+
+
 def vstack(xs):
     xs = [convert_to_tensor(x) for x in xs]
     return torch.vstack(xs)
+
+
+def vsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    if not isinstance(indices_or_sections, int):
+        indices_or_sections = convert_to_tensor(indices_or_sections).tolist()
+    return list(torch.vsplit(x, indices_or_sections))
 
 
 def vectorize(pyfunc, *, excluded=None, signature=None):
@@ -1419,14 +2178,15 @@ def vectorize(pyfunc, *, excluded=None, signature=None):
     )
 
 
-def where(condition, x1, x2):
+def where(condition, x1=None, x2=None):
     condition = convert_to_tensor(condition, dtype=bool)
     if x1 is not None and x2 is not None:
         x1 = convert_to_tensor(x1)
         x2 = convert_to_tensor(x2)
         return torch.where(condition, x1, x2)
     else:
-        return torch.where(condition)
+        # `torch.where(condition)` returns a tuple of tensors.
+        return torch.stack(torch.where(condition), dim=0)
 
 
 def divide(x1, x2):
@@ -1438,11 +2198,15 @@ def divide(x1, x2):
 
 
 def divide_no_nan(x1, x2):
-    if not isinstance(x1, (int, float)):
-        x1 = convert_to_tensor(x1)
-    if not isinstance(x2, (int, float)):
-        x2 = convert_to_tensor(x2)
-    return torch.where(x2 == 0, 0, torch.divide(x1, x2))
+    dtype = dtypes.result_type(
+        getattr(x1, "dtype", type(x1)),
+        getattr(x2, "dtype", type(x2)),
+        float,
+    )
+    x1 = convert_to_tensor(x1, dtype)
+    x2 = convert_to_tensor(x2, dtype)
+    safe_x2 = torch.where(x2 == 0, torch.ones_like(x2), x2)
+    return torch.where(x2 == 0, 0, torch.divide(x1, safe_x2))
 
 
 def true_divide(x1, x2):
@@ -1457,6 +2221,16 @@ def power(x1, x2):
 def negative(x):
     x = convert_to_tensor(x)
     return torch.negative(x)
+
+
+def nextafter(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+    x1 = cast(x1, torch.float64)
+    x2 = cast(x2, torch.float64)
+    return cast(torch.nextafter(x1, x2), dtype)
 
 
 def square(x):
@@ -1485,6 +2259,24 @@ def transpose(x, axes=None):
     if axes is not None:
         return torch.permute(x, dims=axes)
     return x.T
+
+
+def trapezoid(y, x=None, dx=1.0, axis=-1):
+    y = convert_to_tensor(y)
+    if standardize_dtype(y.dtype) == "bool":
+        y = cast(y, config.floatx())
+    if x is not None:
+        x = convert_to_tensor(x)
+        return torch.trapz(y, x=x, dim=axis)
+    else:
+        dx = convert_to_tensor(dx)
+        return torch.trapz(y, dx=dx, dim=axis)
+
+
+def vander(x, N=None, increasing=False):
+    x = convert_to_tensor(x)
+    result_dtype = dtypes.result_type(x.dtype)
+    return cast(torch.vander(x, N=N, increasing=increasing), result_dtype)
 
 
 def var(x, axis=None, keepdims=False):
@@ -1518,7 +2310,7 @@ def sum(x, axis=None, keepdims=False):
     return cast(torch.sum(x), dtype)
 
 
-def eye(N, M=None, k=None, dtype=None):
+def eye(N, M=None, k=0, dtype=None):
     dtype = to_torch_dtype(dtype or config.floatx())
     M = N if M is None else M
     k = 0 if k is None else k
@@ -1552,6 +2344,17 @@ def floor_divide(x1, x2):
 def logical_xor(x1, x2):
     x1, x2 = convert_to_tensor(x1), convert_to_tensor(x2)
     return torch.logical_xor(x1, x2)
+
+
+def corrcoef(x):
+    x = convert_to_tensor(x)
+
+    if standardize_dtype(x.dtype) == "bool":
+        x = cast(x, config.floatx())
+    elif standardize_dtype(x.dtype) == "int64":
+        x = cast(x, "float64")
+
+    return torch.corrcoef(x)
 
 
 def correlate(x1, x2, mode="valid"):
@@ -1617,16 +2420,131 @@ def slogdet(x):
 
 def argpartition(x, kth, axis=-1):
     x = convert_to_tensor(x, "int32")
+
+    if axis is None:
+        x = torch.flatten(x)
+        axis = 0
+        original_axis = None
+    else:
+        original_axis = axis
+
     x = torch.transpose(x, axis, -1)
+
     bottom_ind = torch.topk(-x, kth + 1)[1]
 
     def set_to_zero(a, i):
-        a[i] = torch.zeros(1, dtype=a.dtype, device=a.device)
+        a = a.clone()
+        a[i] = 0
         return a
 
     for _ in range(x.dim() - 1):
         set_to_zero = torch.vmap(set_to_zero)
+
     proxy = set_to_zero(torch.ones_like(x, dtype=torch.int32), bottom_ind)
+
     top_ind = torch.topk(proxy, x.shape[-1] - kth - 1)[1]
-    out = torch.cat([bottom_ind, top_ind], dim=x.dim() - 1)
+
+    out = torch.cat([bottom_ind, top_ind], dim=-1)
+
+    if original_axis is None:
+        return cast(out, "int32")
+
     return cast(torch.transpose(out, -1, axis), "int32")
+
+
+def histogram(x, bins=10, range=None):
+    hist_result = torch.histogram(x, bins=bins, range=range)
+    return hist_result.hist, hist_result.bin_edges
+
+
+def unique(
+    x,
+    sorted=True,
+    return_index=False,
+    return_inverse=False,
+    return_counts=False,
+    axis=None,
+    size=None,
+    fill_value=None,
+):
+    if not isinstance(x, torch.Tensor):
+        x = torch.as_tensor(x)
+
+    output = torch.unique(
+        x,
+        sorted=sorted,  # Added sorted parameter here
+        return_inverse=(return_inverse or return_index),
+        return_counts=return_counts,
+        dim=axis,
+    )
+
+    if not (return_inverse or return_counts or return_index):
+        output = [output]
+    else:
+        output = list(output)
+
+    values = output[0]
+
+    if axis is None:
+        dim = 0
+    else:
+        dim = canonicalize_axis(axis, x.ndim)
+
+    if return_index:
+        inverse = output[1]
+        perm = torch.arange(
+            inverse.size(0), dtype=inverse.dtype, device=inverse.device
+        )
+        unique_indices = inverse.new_empty(values.size(dim)).scatter_reduce_(
+            0, inverse, perm, reduce="min", include_self=False
+        )
+
+    if size is not None:
+        values_count = values.shape[dim]
+
+        if values_count > size:
+            # Truncate
+            indices = [slice(None)] * values.ndim
+            indices[dim] = slice(0, size)
+            values = values[tuple(indices)]
+            if return_counts:
+                output[-1] = output[-1][indices[dim]]
+            if return_index:
+                unique_indices = unique_indices[indices[dim]]
+
+        elif values_count < size:
+            # Pad
+            diff = size - values_count
+            pad_width = [0, 0] * values.ndim
+            # F.pad expects padding from last dim to first
+            idx = (values.ndim - 1 - dim) * 2
+            pad_width[idx + 1] = diff
+            fill = 0 if fill_value is None else fill_value
+            values = torch.nn.functional.pad(values, pad_width, value=fill)
+            if return_counts:
+                output[-1] = torch.nn.functional.pad(
+                    output[-1], pad_width[idx : idx + 2], value=0
+                )
+            if return_index:
+                unique_indices = torch.nn.functional.pad(
+                    unique_indices, pad_width[idx : idx + 2], value=1
+                )
+
+    output[0] = values
+    if return_index and return_inverse:
+        output.insert(1, unique_indices)
+    elif return_index:
+        output[1] = unique_indices
+    return output[0] if len(output) == 1 else tuple(output)
+
+
+def dsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    if not isinstance(indices_or_sections, int):
+        indices_or_sections = convert_to_tensor(indices_or_sections).tolist()
+    return list(torch.dsplit(x, indices_or_sections))
+
+
+def column_stack(xs):
+    xs = [convert_to_tensor(x) for x in xs]
+    return torch.column_stack(xs)

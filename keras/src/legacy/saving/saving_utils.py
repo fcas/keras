@@ -1,14 +1,10 @@
-import json
 import threading
 
 from absl import logging
 
 from keras.src import backend
-from keras.src import layers
 from keras.src import losses
 from keras.src import metrics as metrics_module
-from keras.src import models
-from keras.src import optimizers
 from keras.src import tree
 from keras.src.legacy.saving import serialization
 from keras.src.saving import object_registration
@@ -49,12 +45,21 @@ def model_from_config(config, custom_objects=None):
     global MODULE_OBJECTS
 
     if not hasattr(MODULE_OBJECTS, "ALL_OBJECTS"):
+        from keras.src import layers
+        from keras.src import models
+
         MODULE_OBJECTS.ALL_OBJECTS = layers.__dict__
         MODULE_OBJECTS.ALL_OBJECTS["InputLayer"] = layers.InputLayer
         MODULE_OBJECTS.ALL_OBJECTS["Functional"] = models.Functional
         MODULE_OBJECTS.ALL_OBJECTS["Model"] = models.Model
         MODULE_OBJECTS.ALL_OBJECTS["Sequential"] = models.Sequential
 
+    if not isinstance(config, dict) or "config" not in config:
+        raise ValueError(
+            "The provided configuration is not a valid Keras configuration. "
+            "Expected a dictionary containing a 'config' key. "
+            f"Received: config={config}"
+        )
     batch_input_shape = config["config"].pop("batch_input_shape", None)
     if batch_input_shape is not None:
         if config["class_name"] == "InputLayer":
@@ -63,8 +68,11 @@ def model_from_config(config, custom_objects=None):
             config["config"]["input_shape"] = batch_input_shape
 
     axis = config["config"].pop("axis", None)
-    if axis is not None and isinstance(axis, list) and len(axis) == 1:
-        config["config"]["axis"] = int(axis[0])
+    if axis is not None:
+        if isinstance(axis, list) and len(axis) == 1:
+            config["config"]["axis"] = int(axis[0])
+        elif isinstance(axis, (int, float)):
+            config["config"]["axis"] = int(axis)
 
     # Handle backwards compatibility for Keras lambdas
     if config["class_name"] == "Lambda":
@@ -77,10 +85,6 @@ def model_from_config(config, custom_objects=None):
             function_dict["config"]["defaults"] = function_config[1]
             function_dict["config"]["closure"] = function_config[2]
             config["config"]["function"] = function_dict
-
-    # TODO(nkovela): Swap find and replace args during Keras 3.0 release
-    # Replace keras refs with keras
-    config = _find_replace_nested_dict(config, "keras.", "keras.")
 
     return serialization.deserialize_keras_object(
         config,
@@ -129,6 +133,8 @@ def compile_args_from_training_config(training_config, custom_objects=None):
         custom_objects = {}
 
     with object_registration.CustomObjectScope(custom_objects):
+        from keras.src import optimizers
+
         optimizer_config = training_config["optimizer_config"]
         optimizer = optimizers.deserialize(optimizer_config)
         # Ensure backwards compatibility for optimizers in legacy H5 files
@@ -224,13 +230,6 @@ def _deserialize_metric(metric_config):
         # shape.
         return metric_config
     return metrics_module.deserialize(metric_config)
-
-
-def _find_replace_nested_dict(config, find, replace):
-    dict_str = json.dumps(config)
-    dict_str = dict_str.replace(find, replace)
-    config = json.loads(dict_str)
-    return config
 
 
 def _resolve_compile_arguments_compat(obj, obj_config, module):

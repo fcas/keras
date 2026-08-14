@@ -6,9 +6,6 @@ from keras.src import backend
 from keras.src import layers
 from keras.src import testing
 from keras.src.backend.common.backend_utils import (
-    _convert_conv_tranpose_padding_args_from_keras_to_torch,
-)
-from keras.src.backend.common.backend_utils import (
     compute_conv_transpose_output_shape,
 )
 from keras.src.backend.common.backend_utils import (
@@ -63,9 +60,9 @@ def np_conv1d_transpose(
     if h_dilation > 1:
         # Increase kernel size
         new_h_kernel = h_kernel + (h_dilation - 1) * (h_kernel - 1)
-        new_kenel_size_tuple = (new_h_kernel,)
+        new_kernel_size_tuple = (new_h_kernel,)
         new_kernel_weights = np.zeros(
-            (*new_kenel_size_tuple, ch_out, ch_in),
+            (*new_kernel_size_tuple, ch_out, ch_in),
             dtype=kernel_weights.dtype,
         )
         new_kernel_weights[::h_dilation] = kernel_weights
@@ -140,9 +137,9 @@ def np_conv2d_transpose(
         # Increase kernel size
         new_h_kernel = h_kernel + (h_dilation - 1) * (h_kernel - 1)
         new_w_kernel = w_kernel + (w_dilation - 1) * (w_kernel - 1)
-        new_kenel_size_tuple = (new_h_kernel, new_w_kernel)
+        new_kernel_size_tuple = (new_h_kernel, new_w_kernel)
         new_kernel_weights = np.zeros(
-            (*new_kenel_size_tuple, ch_out, ch_in),
+            (*new_kernel_size_tuple, ch_out, ch_in),
             dtype=kernel_weights.dtype,
         )
         new_kernel_weights[::h_dilation, ::w_dilation] = kernel_weights
@@ -233,9 +230,9 @@ def np_conv3d_transpose(
         new_h_kernel = h_kernel + (h_dilation - 1) * (h_kernel - 1)
         new_w_kernel = w_kernel + (w_dilation - 1) * (w_kernel - 1)
         new_d_kernel = d_kernel + (d_dilation - 1) * (d_kernel - 1)
-        new_kenel_size_tuple = (new_h_kernel, new_w_kernel, new_d_kernel)
+        new_kernel_size_tuple = (new_h_kernel, new_w_kernel, new_d_kernel)
         new_kernel_weights = np.zeros(
-            (*new_kenel_size_tuple, ch_out, ch_in),
+            (*new_kernel_size_tuple, ch_out, ch_in),
             dtype=kernel_weights.dtype,
         )
         new_kernel_weights[::h_dilation, ::w_dilation, ::d_dilation] = (
@@ -286,7 +283,8 @@ def np_conv3d_transpose(
     return output
 
 
-class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
+@pytest.mark.skipif(testing.jax_uses_tpu(), reason="Crashes with JAX on TPU")
+class ConvTransposeBasicTest(testing.TestCase):
     @parameterized.parameters(
         {
             "filters": 5,
@@ -322,7 +320,6 @@ class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
             "output_shape": (2, 16, 6),
         },
     )
-    @pytest.mark.requires_trainable_backend
     def test_conv1d_transpose_basic(
         self,
         filters,
@@ -400,7 +397,6 @@ class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
             "output_shape": (1, 224, 224, 2),
         },
     )
-    @pytest.mark.requires_trainable_backend
     def test_conv2d_transpose_basic(
         self,
         filters,
@@ -473,7 +469,6 @@ class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
             "output_shape": (2, 16, 9, 17, 6),
         },
     )
-    @pytest.mark.requires_trainable_backend
     def test_conv3d_transpose_basic(
         self,
         filters,
@@ -505,6 +500,33 @@ class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
             supports_masking=False,
         )
 
+    @parameterized.parameters(
+        {
+            "layer_cls": layers.Conv1DTranspose,
+            "input_shape": (1, 8, 3),
+        },
+        {
+            "layer_cls": layers.Conv2DTranspose,
+            "input_shape": (1, 5, 5, 3),
+        },
+        {
+            "layer_cls": layers.Conv3DTranspose,
+            "input_shape": (1, 5, 5, 5, 3),
+        },
+    )
+    def test_output_padding_serialization(self, layer_cls, input_shape):
+        # `output_padding` was previously dropped from `get_config`, so a
+        # round-trip silently reset it to `None` and changed the output shape.
+        layer = layer_cls(2, 3, strides=2, output_padding=1)
+        config = layer.get_config()
+        self.assertIn("output_padding", config)
+        revived = layer_cls.from_config(config)
+        self.assertEqual(layer.output_padding, revived.output_padding)
+        self.assertEqual(
+            layer.compute_output_shape(input_shape),
+            revived.compute_output_shape(input_shape),
+        )
+
     def test_bad_init_args(self):
         # `filters` is not positive.
         with self.assertRaisesRegex(
@@ -534,6 +556,37 @@ class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
                 filters=2, kernel_size=(2, 2), strides=(1, 0)
             )
 
+        # `output_padding` >= `strides`.
+        with self.assertRaisesRegex(
+            ValueError,
+            r"`output_padding` must be strictly less than `strides`",
+        ):
+            layers.Conv1DTranspose(
+                filters=2, kernel_size=3, strides=2, output_padding=2
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"`output_padding` must be strictly less than `strides`",
+        ):
+            layers.Conv2DTranspose(
+                filters=2,
+                kernel_size=3,
+                strides=2,
+                output_padding=3,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"`output_padding` must be strictly less than `strides`",
+        ):
+            layers.Conv2DTranspose(
+                filters=2,
+                kernel_size=3,
+                strides=(2, 3),
+                output_padding=(1, 3),
+            )
+
         # `dilation_rate > 1` while `strides > 1`.
         with self.assertRaisesRegex(
             ValueError,
@@ -545,8 +598,32 @@ class ConvTransposeBasicTest(testing.TestCase, parameterized.TestCase):
                 filters=2, kernel_size=(2, 2), strides=2, dilation_rate=(2, 1)
             )
 
+        with self.assertRaisesRegex(
+            ValueError,
+            "`output_padding` must be strictly less than `strides`",
+        ):
+            layers.Conv1DTranspose(
+                filters=2, kernel_size=2, strides=2, output_padding=2
+            )
 
-class ConvTransposeCorrectnessTest(testing.TestCase, parameterized.TestCase):
+        with self.assertRaisesRegex(
+            ValueError,
+            "`output_padding` must be strictly less than `strides`",
+        ):
+            layers.Conv2DTranspose(
+                filters=16, kernel_size=3, strides=[1, 1], output_padding=1
+            )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "`output_padding` must be strictly less than `strides`",
+        ):
+            layers.Conv3DTranspose(
+                filters=8, kernel_size=3, strides=1, output_padding=1
+            )
+
+
+class ConvTransposeCorrectnessTest(testing.TestCase):
     @parameterized.parameters(
         {
             "filters": 5,
@@ -616,7 +693,9 @@ class ConvTransposeCorrectnessTest(testing.TestCase, parameterized.TestCase):
             data_format,
             dilation_rate,
         )
-        self.assertAllClose(outputs, expected, atol=1e-5)
+        self.assertAllClose(
+            outputs, expected, atol=1e-5, tpu_atol=1e-1, tpu_rtol=1e-1
+        )
 
     @parameterized.parameters(
         {
@@ -696,7 +775,9 @@ class ConvTransposeCorrectnessTest(testing.TestCase, parameterized.TestCase):
             data_format,
             dilation_rate,
         )
-        self.assertAllClose(outputs, expected, atol=1e-5)
+        self.assertAllClose(
+            outputs, expected, atol=1e-5, tpu_atol=1e-1, tpu_rtol=1e-1
+        )
 
     @parameterized.parameters(
         {
@@ -767,7 +848,9 @@ class ConvTransposeCorrectnessTest(testing.TestCase, parameterized.TestCase):
             data_format,
             dilation_rate,
         )
-        self.assertAllClose(outputs, expected, atol=1e-5)
+        self.assertAllClose(
+            outputs, expected, atol=1e-5, tpu_atol=1e-1, tpu_rtol=1e-1
+        )
 
     @parameterized.product(
         kernel_size=list(range(1, 5)),
@@ -823,42 +906,9 @@ class ConvTransposeCorrectnessTest(testing.TestCase, parameterized.TestCase):
         kc_layer.build(input_shape=input_shape)
         kc_layer.kernel.assign(kernel_weights)
 
-        # Special cases for Torch
-        if backend.backend() == "torch":
-            # The following set of arguments lead to Torch output padding to be
-            # greater than strides, which is not supported by Torch.
-            # An error is raised.
-            if (kernel_size, strides, padding, output_padding) in [
-                (2, 1, "same", None),
-                (4, 1, "same", None),
-            ]:
-                with pytest.raises(ValueError):
-                    kc_res = kc_layer(input)
-                return
-
-            # When both torch_padding and torch_output_padding are greater
-            # than 0, Torch outputs are inconsistent with the ones from
-            # Tensorflow. A warning is raised, and we expect the results to be
-            # different.
-            (
-                torch_padding,
-                torch_output_padding,
-            ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
-                kernel_size=kernel_size,
-                stride=strides,
-                dilation_rate=1,
-                padding=padding,
-                output_padding=output_padding,
-            )
-            if torch_padding > 0 and torch_output_padding > 0:
-                with pytest.raises(AssertionError):
-                    kc_res = kc_layer(input)
-                    self.assertAllClose(expected_res, kc_res, atol=1e-5)
-                return
-
         # Compare results
         kc_res = kc_layer(input)
-        self.assertAllClose(expected_res, kc_res, atol=1e-5)
+        self.assertAllClose(kc_res, expected_res, atol=1e-5)
 
     @parameterized.product(
         kernel_size=list(range(1, 5)),
@@ -869,6 +919,10 @@ class ConvTransposeCorrectnessTest(testing.TestCase, parameterized.TestCase):
     def test_shape_inference_static_unknown_shape(
         self, kernel_size, strides, padding, output_padding
     ):
+        # output_padding cannot be greater than or equal to strides
+        if output_padding is not None and output_padding >= strides:
+            pytest.skip("`output_padding` must be less than `strides`")
+
         if backend.config.image_data_format() == "channels_last":
             input_shape = (None, None, 3)
             output_tensor_shape = (None, None, None, 2)

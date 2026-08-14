@@ -2,21 +2,22 @@ import numpy as np
 
 from keras.src import backend
 from keras.src.api_export import keras_export
-from keras.src.layers.preprocessing.tf_data_layer import TFDataLayer
+from keras.src.layers.preprocessing.data_layer import DataLayer
 from keras.src.utils import argument_validation
 from keras.src.utils import numerical_utils
 from keras.src.utils.module_utils import tensorflow as tf
+from keras.src.utils.progbar import Progbar
 
 
 @keras_export("keras.layers.Discretization")
-class Discretization(TFDataLayer):
+class Discretization(DataLayer):
     """A preprocessing layer which buckets continuous features by ranges.
 
     This layer will place each element of its input data into one of several
     contiguous ranges and output an integer index indicating which range each
     element was placed in.
 
-    **Note:** This layer is safe to use inside a `tf.data` pipeline
+    **Note:** This layer is safe to use inside a `tf.data` or `grain` pipeline
     (independently of which backend you're using).
 
     Input shape:
@@ -34,7 +35,7 @@ class Discretization(TFDataLayer):
             and `[2., +inf)`.
             If this option is set, `adapt()` should not be called.
         num_bins: The integer number of bins to compute.
-            If this option is set,
+            If this option is set, `bin_boundaries` should not be set and
             `adapt()` should be called to learn the bin boundaries.
         epsilon: Error tolerance, typically a small fraction
             close to zero (e.g. 0.01). Higher values of epsilon increase
@@ -95,14 +96,11 @@ class Discretization(TFDataLayer):
         dtype=None,
         name=None,
     ):
-        if dtype is None:
-            dtype = "int64" if output_mode == "int" else backend.floatx()
-
         super().__init__(name=name, dtype=dtype)
 
-        if sparse and backend.backend() != "tensorflow":
+        if sparse and not backend.SUPPORTS_SPARSE_TENSORS:
             raise ValueError(
-                "`sparse=True` can only be used with the " "TensorFlow backend."
+                f"`sparse=True` cannot be used with backend {backend.backend()}"
             )
         if sparse and output_mode == "int":
             raise ValueError(
@@ -130,17 +128,17 @@ class Discretization(TFDataLayer):
                 f"Received: `num_bins={num_bins}`"
             )
         if num_bins is not None and bin_boundaries is not None:
-            if len(bin_boundaries) != num_bins - 1:
-                raise ValueError(
-                    "Both `num_bins` and `bin_boundaries` should not be "
-                    f"set. Received: `num_bins={num_bins}` and "
-                    f"`bin_boundaries={bin_boundaries}`"
-                )
+            raise ValueError(
+                "Both `num_bins` and `bin_boundaries` should not be set. "
+                f"Received: `num_bins={num_bins}` and "
+                f"`bin_boundaries={bin_boundaries}`"
+            )
+        if num_bins is None and bin_boundaries is None:
+            raise ValueError(
+                "You need to set either `num_bins` or `bin_boundaries`."
+            )
 
-        self.input_bin_boundaries = bin_boundaries
-        self.bin_boundaries = (
-            bin_boundaries if bin_boundaries is not None else []
-        )
+        self.bin_boundaries = bin_boundaries
         self.num_bins = num_bins
         self.epsilon = epsilon
         self.output_mode = output_mode
@@ -151,12 +149,13 @@ class Discretization(TFDataLayer):
         else:
             self.summary = np.array([[], []], dtype="float32")
 
-    def build(self, input_shape=None):
-        self.built = True
-
     @property
     def input_dtype(self):
         return backend.floatx()
+
+    @property
+    def output_dtype(self):
+        return self.compute_dtype if self.output_mode != "int" else "int32"
 
     def adapt(self, data, steps=None):
         """Computes bin boundaries from quantiles in a input dataset.
@@ -173,8 +172,9 @@ class Discretization(TFDataLayer):
 
         Arguments:
             data: The data to train on. It can be passed either as a
-                batched `tf.data.Dataset`,
-                or as a NumPy array.
+                batched `tf.data.Dataset`, a Grain dataset, as a NumPy
+                array, or as any iterable of batches (e.g. a list of
+                arrays or a generator yielding batches).
             steps: Integer or `None`.
                 Total number of steps (batches of samples) to process.
                 If `data` is a `tf.data.Dataset`, and `steps` is `None`,
@@ -183,17 +183,40 @@ class Discretization(TFDataLayer):
                 repeating dataset, you must specify the `steps` argument. This
                 argument is not supported with array inputs or list inputs.
         """
-        if self.input_bin_boundaries is not None:
+        if self.num_bins is None:
             raise ValueError(
                 "Cannot adapt a Discretization layer that has been initialized "
                 "with `bin_boundaries`, use `num_bins` instead."
             )
         self.reset_state()
         if isinstance(data, tf.data.Dataset):
+            if steps is None and hasattr(data, "cardinality"):
+                cardinality = data.cardinality()
+                if cardinality.numpy() not in (
+                    tf.data.UNKNOWN_CARDINALITY,
+                    tf.data.INFINITE_CARDINALITY,
+                ):
+                    steps = int(cardinality.numpy())
+
+            progbar = Progbar(target=steps, unit_name="step")
             if steps is not None:
                 data = data.take(steps)
-            for batch in data:
+            for i, batch in enumerate(data):
                 self.update_state(batch)
+                progbar.update(i + 1)
+            progbar.update(steps if steps is not None else i + 1, finalize=True)
+        elif hasattr(data, "__iter__") and not (
+            isinstance(data, np.ndarray)
+            or backend.is_tensor(data)
+            or tf.is_tensor(data)
+        ):
+            progbar = Progbar(target=steps, unit_name="step")
+            for i, batch in enumerate(data):
+                if steps is not None and i >= steps:
+                    break
+                self.update_state(batch)
+                progbar.update(i + 1)
+            progbar.update(steps if steps is not None else i + 1, finalize=True)
         else:
             self.update_state(data)
         self.finalize_state()
@@ -204,19 +227,48 @@ class Discretization(TFDataLayer):
         self.summary = merge_summaries(summary, self.summary, self.epsilon)
 
     def finalize_state(self):
-        if self.input_bin_boundaries is not None:
+        if self.num_bins is None:
             return
         self.bin_boundaries = get_bin_boundaries(
             self.summary, self.num_bins
         ).tolist()
 
     def reset_state(self):
-        if self.input_bin_boundaries is not None:
+        if self.num_bins is None:
             return
         self.summary = np.array([[], []], dtype="float32")
 
+    def compute_output_shape(self, input_shape):
+        if self.output_mode == "int":
+            return input_shape
+
+        # Calculate depth (number of bins)
+        depth = (
+            len(self.bin_boundaries) + 1
+            if self.bin_boundaries is not None
+            else self.num_bins
+        )
+
+        if self.output_mode == "one_hot":
+            # For one_hot mode, add depth dimension
+            # If last dimension is 1, replace it with depth, otherwise append
+            if input_shape and input_shape[-1] == 1 and len(input_shape) > 1:
+                return tuple(input_shape[:-1]) + (depth,)
+            else:
+                return tuple(input_shape) + (depth,)
+        else:
+            if input_shape and len(input_shape) >= 2:
+                # Match to eager tensor, remove second and append depth
+                out_shape = (
+                    (input_shape[0],) + tuple(input_shape[2:]) + (depth,)
+                )
+                return out_shape
+            else:
+                return (depth,)
+
     def compute_output_spec(self, inputs):
-        return backend.KerasTensor(shape=inputs.shape, dtype=self.compute_dtype)
+        output_shape = self.compute_output_shape(inputs.shape)
+        return backend.KerasTensor(shape=output_shape, dtype=self.output_dtype)
 
     def load_own_variables(self, store):
         if len(store) == 1:
@@ -225,17 +277,22 @@ class Discretization(TFDataLayer):
         return
 
     def call(self, inputs):
+        if self.bin_boundaries is None:
+            raise ValueError(
+                "You need to either pass the `bin_boundaries` argument at "
+                "construction time or call `adapt(dataset)` before you can "
+                "start using the `Discretization` layer."
+            )
+
         indices = self.backend.numpy.digitize(inputs, self.bin_boundaries)
-        outputs = numerical_utils.encode_categorical_inputs(
+        return numerical_utils.encode_categorical_inputs(
             indices,
             output_mode=self.output_mode,
             depth=len(self.bin_boundaries) + 1,
-            dtype=self.compute_dtype,
+            dtype=self.output_dtype,
+            sparse=self.sparse,
             backend_module=self.backend,
         )
-        if self.sparse:
-            return tf.sparse.from_dense(outputs)
-        return outputs
 
     def get_config(self):
         return {
@@ -247,6 +304,23 @@ class Discretization(TFDataLayer):
             "name": self.name,
             "dtype": self.dtype,
         }
+
+    @classmethod
+    def from_config(cls, config, custom_objects=None):
+        if (
+            config.get("bin_boundaries", None) is not None
+            and config.get("num_bins", None) is not None
+        ):
+            # After `adapt` was called, both `bin_boundaries` and `num_bins` are
+            # populated, but `__init__` won't let us create a new layer with
+            # both `bin_boundaries` and `num_bins`. We therefore apply
+            # `bin_boundaries` after creation.
+            config = config.copy()
+            bin_boundaries = config.pop("bin_boundaries")
+            discretization = cls(**config)
+            discretization.bin_boundaries = bin_boundaries
+            return discretization
+        return cls(**config)
 
 
 def summarize(values, epsilon):
@@ -274,8 +348,8 @@ def summarize(values, epsilon):
     elements = np.size(values)
     num_buckets = 1.0 / epsilon
     increment = elements / num_buckets
-    start = increment
     step = max(increment, 1)
+    start = step - 1
     boundaries = values[int(start) :: int(step)]
     weights = np.ones_like(boundaries)
     weights = weights * step

@@ -1,20 +1,35 @@
-namex>=0.0.8
-black>=22
-flake8
-isort
-pytest
+pre-commit
+namex>=0.1.0
+ruff
 numpy
 scipy
+scikit-learn
+pillow
 pandas
 absl-py
 requests
 h5py
 ml-dtypes
 protobuf
-google
+tensorboard
 tensorboard-plugin-profile
 rich
 build
 optree
+pytest
 pytest-cov
+pytest-xdist
 packaging
+# for tree_test.py
+dm_tree
+coverage
+# for onnx_test.py
+onnxruntime
+# https://github.com/keras-team/keras/issues/21390
+# onnxscript==0.3.2 breaks LSTM model export.
+onnxscript!=0.3.2
+jax2onnx
+tf2onnx
+grain
+# for orbax_checkpoint_test.py
+orbax-checkpoint

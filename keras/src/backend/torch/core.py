@@ -1,4 +1,7 @@
+import builtins
 import contextlib
+import functools
+import os
 
 import ml_dtypes
 import numpy as np
@@ -8,22 +11,38 @@ from keras.src import tree
 from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import global_state
 from keras.src.backend.common import standardize_dtype
+from keras.src.backend.common.backend_utils import slice_along_axis
 from keras.src.backend.common.dtypes import result_type
 from keras.src.backend.common.keras_tensor import KerasTensor
 from keras.src.backend.common.stateless_scope import StatelessScope
+from keras.src.backend.common.stateless_scope import get_stateless_scope
+from keras.src.backend.common.stateless_scope import in_stateless_scope
+from keras.src.backend.common.symbolic_scope import SymbolicScope
 from keras.src.backend.config import floatx
 
 SUPPORTS_SPARSE_TENSORS = False
+SUPPORTS_RAGGED_TENSORS = False
+SUPPORTS_COMPLEX_DTYPES = True
+IS_THREAD_SAFE = True
 
 # Some operators such as 'aten::_foreach_mul_.Scalar'
 # are not currently implemented for the MPS device.
 # check https://github.com/pytorch/pytorch/issues/77764.
-if torch.backends.mps.is_available():
+if "KERAS_TORCH_DEVICE" in os.environ:
+    DEFAULT_DEVICE = os.environ["KERAS_TORCH_DEVICE"]
+elif torch.backends.mps.is_available():
     DEFAULT_DEVICE = "mps"
 elif torch.cuda.is_available():
     DEFAULT_DEVICE = "cuda"
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEFAULT_DEVICE = "xpu"
 else:
-    DEFAULT_DEVICE = "cpu"
+    from keras.src.utils.module_utils import torch_xla
+
+    if torch_xla.available and torch_xla.core.xla_model.xla_device_count() > 0:
+        DEFAULT_DEVICE = "tpu"
+    else:
+        DEFAULT_DEVICE = "cpu"
 
 TORCH_DTYPES = {
     "float16": torch.float16,
@@ -40,6 +59,9 @@ TORCH_DTYPES = {
     "bool": torch.bool,
     "float8_e4m3fn": torch.float8_e4m3fn,
     "float8_e5m2": torch.float8_e5m2,
+    "complex32": torch.complex32,
+    "complex64": torch.complex64,
+    "complex128": torch.complex128,
 }
 
 
@@ -49,7 +71,7 @@ def device_scope(device_name):
     current_device = _parse_device_input(device_name)
     global_state.set_global_attribute("torch_device", current_device)
     try:
-        yield
+        yield torch.device(current_device)
     finally:
         global_state.set_global_attribute("torch_device", previous_device)
 
@@ -106,13 +128,11 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        args = [
-            arg.value if isinstance(arg, KerasVariable) else arg for arg in args
-        ]
+        args = [arg.value if isinstance(arg, Variable) else arg for arg in args]
         if kwargs is None:
             kwargs = {}
         kwargs = {
-            key: value.value if isinstance(value, KerasVariable) else value
+            key: value.value if isinstance(value, Variable) else value
             for key, value in kwargs.items()
         }
         return func(*args, **kwargs)
@@ -125,15 +145,38 @@ class Variable(KerasVariable):
 
     @property
     def value(self):
-        value = super().value
-        # Create and use a symbolic tensor stub in symbolic calls.
-        if str(get_device()) == "meta" and str(value.device) != "meta":
-            return torch.empty(
-                size=value.shape,
-                dtype=value.dtype,
-                device="meta",
+        # We cannot chain super() here because it will fail TorchDynamo. The
+        # reason why is unclear.
+        def maybe_use_symbolic_tensor(value):
+            # Create and use a symbolic tensor stub in symbolic calls.
+            if str(get_device()) == "meta" and str(value.device) != "meta":
+                return torch.nn.Parameter(
+                    torch.empty(
+                        size=self._shape,
+                        dtype=to_torch_dtype(self._dtype),
+                        device="meta",
+                    ),
+                    requires_grad=self.trainable,
+                )
+            return value
+
+        if in_stateless_scope():
+            scope = get_stateless_scope()
+            value = scope.get_current_value(self)
+            if value is not None:
+                value = self._maybe_autocast(value)
+                return maybe_use_symbolic_tensor(value)
+        if self._value is None:
+            # Uninitialized variable. Return a placeholder.
+            # This is fine because it's only ever used
+            # in during shape inference / graph tracing
+            # (anything else would be a bug, to be fixed.)
+            value = self._maybe_autocast(
+                self._initializer(self._shape, dtype=self._dtype)
             )
-        return value
+        else:
+            value = self._maybe_autocast(self._value)
+        return maybe_use_symbolic_tensor(value)
 
     @property
     def trainable(self):
@@ -152,37 +195,58 @@ class Variable(KerasVariable):
             return False
 
 
-def convert_to_tensor(x, dtype=None, sparse=None):
+def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
     if sparse:
         raise ValueError("`sparse=True` is not supported with torch backend")
-    if is_tensor(x):
+    if ragged:
+        raise ValueError("`ragged=True` is not supported with torch backend")
+    if isinstance(x, Variable) or is_tensor(x):
+        if isinstance(x, Variable):
+            x = x.value
         device = get_device()
         if x.device != device:
-            x = x.to(device)
-        if dtype is None:
-            return x
-        return x.to(to_torch_dtype(dtype))
-    if isinstance(x, Variable):
-        # TorchDynamo has bugs supporting nn.Parameter type check.
-        # Return it directly instead of pass it to the rest of the logic in the
-        # function.
-        return x.value
-    if dtype is None:
-        if isinstance(x, bool):
-            return torch.as_tensor(x, dtype=torch.bool, device=get_device())
+            if x.is_meta:
+                x = torch.empty_like(x, device=device)
+            else:
+                x = x.to(device)
+        if dtype is not None:
+            x = x.to(to_torch_dtype(dtype))
+        return x
+    if isinstance(x, (bool, int, float, complex)):
+        if dtype is not None:
+            dt = to_torch_dtype(dtype)
+        elif isinstance(x, bool):
+            dt = torch.bool
         elif isinstance(x, int):
-            return torch.as_tensor(x, dtype=torch.int32, device=get_device())
+            dt = torch.int64 if x < -(2**31) or x >= 2**31 else torch.int32
         elif isinstance(x, float):
-            return torch.as_tensor(
-                x, dtype=to_torch_dtype(floatx()), device=get_device()
-            )
+            dt = to_torch_dtype(floatx())
+        else:
+            dt = torch.complex64
+        return torch.as_tensor(x, dtype=dt, device=get_device())
+    if isinstance(x, (torch.SymInt, torch.SymFloat)):
+        # Scalar symbolic values from torch.export can't go through numpy.
+        dt = to_torch_dtype(dtype) if dtype is not None else None
+        return torch.as_tensor(x, dtype=dt, device=get_device())
 
     # Convert to np in case of any array-like that is not list or tuple.
-    if not isinstance(x, (list, tuple)):
+    # Skip scalar Python values to avoid np.array(float) -> float64, which
+    # causes dtype issues during torch.export (constants are lifted before
+    # the cast to the requested dtype).
+    if isinstance(x, (list, tuple)):
+        if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+            # Handle list or tuple of torch tensors
+            return torch.stack([convert_to_tensor(x1) for x1 in x])
+        if len(x) > 0 and any(
+            isinstance(x1, (torch.SymInt, torch.SymFloat))
+            for x1 in tree.flatten(x)
+        ):
+            # Symbolic shape values from torch.export can't go through numpy
+            # and don't have a .dtype attribute. Use torch.as_tensor directly.
+            dt = to_torch_dtype(dtype) if dtype is not None else None
+            return torch.as_tensor(x, dtype=dt, device=get_device())
+    elif not isinstance(x, (bool, int, float)):
         x = np.array(x)
-    elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-        # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
             # Torch backend does not support uint32.
@@ -206,7 +270,7 @@ def convert_to_numpy(x):
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
-            if x.is_cuda or x.is_mps:
+            if x.device != torch.device("cpu"):
                 x = x.cpu()
             if x.dtype == torch.bfloat16:
                 # Attempting to call .numpy() on a bfloat16 torch tensor leads
@@ -240,7 +304,7 @@ def shape(x):
 
 def cast(x, dtype):
     dtype = to_torch_dtype(dtype)
-    if isinstance(x, KerasVariable):
+    if isinstance(x, Variable):
         x = x.value
     if is_tensor(x):
         if x.dtype == dtype:
@@ -302,10 +366,12 @@ def compute_output_spec(fn, *args, **kwargs):
                 )
                 return fn(*eager_args, **eager_kwargs)
 
-    with StatelessScope(), torch.no_grad():
+    with StatelessScope(), SymbolicScope(), torch.no_grad():
         outputs = symbolic_call(fn, args, kwargs, fill_value=83)
 
-        none_in_shape = any(map(has_none_shape, tree.flatten((args, kwargs))))
+        none_in_shape = any(
+            builtins.map(has_none_shape, tree.flatten((args, kwargs)))
+        )
         if none_in_shape:
             outputs_1 = outputs
             outputs_2 = symbolic_call(fn, args, kwargs, fill_value=89)
@@ -338,6 +404,14 @@ def cond(pred, true_fn, false_fn):
 
 def vectorized_map(function, elements):
     return torch.vmap(function)(elements)
+
+
+def map(f, xs):
+    def g(_, x):
+        return (), f(x)
+
+    _, ys = scan(g, (), xs)
+    return ys
 
 
 def scan(f, init, xs=None, length=None, reverse=False, unroll=1):
@@ -389,8 +463,131 @@ def scan(f, init, xs=None, length=None, reverse=False, unroll=1):
     return carry, stacked_y
 
 
+def associative_scan(f, elems, reverse=False, axis=0):
+    # Ref: jax.lax.associative_scan
+    if not callable(f):
+        raise TypeError(f"`f` should be a callable. Received: f={f}")
+    elems_flat = tree.flatten(elems)
+    elems_flat = [convert_to_tensor(elem) for elem in elems_flat]
+    if reverse:
+        elems_flat = [torch.flip(elem, (axis,)) for elem in elems_flat]
+
+    def _combine(a_flat, b_flat):
+        a_flat = [convert_to_tensor(a) for a in a_flat]
+        b_flat = [convert_to_tensor(b) for b in b_flat]
+
+        a = tree.pack_sequence_as(elems, a_flat)
+        b = tree.pack_sequence_as(elems, b_flat)
+        c = f(a, b)
+        c_flat = tree.flatten(c)
+        return c_flat
+
+    num_elems = int(elems_flat[0].shape[axis])
+    if not all(int(elem.shape[axis]) == num_elems for elem in elems_flat[1:]):
+        raise ValueError(
+            "Array inputs to associative_scan must have the same "
+            "first dimension. (saw: {})".format(
+                [elem.shape for elem in elems_flat]
+            )
+        )
+
+    def _interleave(a, b, axis):
+        """Given two Tensors of static shape, interleave them along axis."""
+        if not (
+            a.shape[axis] == b.shape[axis] or a.shape[axis] == b.shape[axis] + 1
+        ):
+            raise ValueError(
+                "Shapes are incompatible for associative_scan interleaving. "
+                f"a.shape[{axis}]={a.shape[axis]}, "
+                f"b.shape[{axis}]={b.shape[axis]}"
+            )
+
+        # we want to get a: [a1, a2], b: [b1, b2]
+        # to a: [a1, 0, a2, 0], b: [0, b1, 0, b2]
+        a_shape = list(a.shape)
+        a_shape[axis] = a.shape[axis] * 2 - 1
+
+        b_shape = list(b.shape)
+        b_shape[axis] = b.shape[axis] * 2 - 1
+
+        a_dil = torch.zeros(a_shape)
+        slice_along_axis(a_dil, 0, None, 2, axis).copy_(a)
+
+        b_dil = torch.zeros(b_shape)
+        slice_along_axis(b_dil, 0, None, 2, axis).copy_(b)
+
+        a_pad = [[0, 0] for _ in range(a.dim())]
+        a_pad[axis][-1] = 1 if a.shape[axis] == b.shape[axis] else 0
+        a_pad = a_pad[::-1]
+        a_pad = tree.flatten(a_pad)
+
+        b_pad = [[0, 0] for _ in range(b.dim())]
+        b_pad[axis] = [1, 0] if a.shape[axis] == b.shape[axis] else [1, 1]
+        b_pad = b_pad[::-1]
+        b_pad = tree.flatten(b_pad)
+
+        op = torch.bitwise_or if a.dtype == torch.bool else torch.add
+        return op(
+            torch.nn.functional.pad(a_dil, a_pad),
+            torch.nn.functional.pad(b_dil, b_pad),
+        )
+
+    def _scan(elems):
+        num_elems = elems[0].shape[axis]
+        if num_elems < 2:
+            return elems
+
+        reduced_elems = _combine(
+            [
+                slice_along_axis(elem, 0, -1, step=2, axis=axis)
+                for elem in elems
+            ],
+            [
+                slice_along_axis(elem, 1, None, step=2, axis=axis)
+                for elem in elems
+            ],
+        )
+
+        odd_elems = _scan(reduced_elems)
+        if num_elems % 2 == 0:
+            even_elems = _combine(
+                [slice_along_axis(e, 0, -1, axis=axis) for e in odd_elems],
+                [
+                    slice_along_axis(e, 2, None, step=2, axis=axis)
+                    for e in elems
+                ],
+            )
+        else:
+            even_elems = _combine(
+                odd_elems,
+                [
+                    slice_along_axis(e, 2, None, step=2, axis=axis)
+                    for e in elems
+                ],
+            )
+
+        even_elems = [
+            torch.cat(
+                [slice_along_axis(elem, 0, 1, axis=axis), result],
+                dim=axis,
+            )
+            for (elem, result) in zip(elems, even_elems)
+        ]
+        return list(
+            builtins.map(
+                functools.partial(_interleave, axis=axis), even_elems, odd_elems
+            )
+        )
+
+    scans = _scan(elems_flat)
+    if reverse:
+        scans = [torch.flip(scanned, (axis,)) for scanned in scans]
+
+    return tree.pack_sequence_as(elems, scans)
+
+
 def scatter(indices, values, shape):
-    indices = convert_to_tensor(indices)
+    indices = convert_to_tensor(indices, dtype="int64")
     values = convert_to_tensor(values)
     zeros = torch.zeros(shape, dtype=values.dtype, device=get_device())
 
@@ -399,50 +596,130 @@ def scatter(indices, values, shape):
     indices = torch.reshape(indices, [-1, index_length])
     values = torch.reshape(values, [-1] + list(value_shape))
 
-    for i in range(indices.shape[0]):
-        index = indices[i]
-        zeros[tuple(index)] += values[i]
+    # Vectorized scatter-add: index_put_ with accumulate=True applies all
+    # updates in one call and sums duplicate indices, instead of a Python loop
+    # over every index (which is very slow for metrics like MeanIoU that
+    # scatter one update per pixel).
+    idx = tuple(indices.transpose(0, 1))
+    zeros.index_put_(idx, values, accumulate=True)
     return zeros
 
 
-def scatter_update(inputs, indices, updates):
+def scatter_update(inputs, indices, updates, reduction=None):
     inputs = convert_to_tensor(inputs)
     indices = convert_to_tensor(indices, dtype="int64")
-    updates = convert_to_tensor(updates)
+    updates = convert_to_tensor(updates, dtype=inputs.dtype)
     indices = torch.transpose(indices, 0, 1)
+    idx = tuple(indices)
 
-    inputs[tuple(indices)] = updates
-    return inputs
+    outputs = torch.clone(inputs)
+    if reduction is None:
+        outputs[idx] = updates
+    elif reduction == "add":
+        # Use index_put_ with accumulate=True for proper accumulation
+        outputs.index_put_(idx, updates, accumulate=True)
+    elif reduction == "max":
+        # Loop-based approach handles both scalar and slice updates.
+        # Associative, so sequential application handles duplicates.
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = torch.maximum(outputs[idx], updates[i])
+    elif reduction == "min":
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = torch.minimum(outputs[idx], updates[i])
+    elif reduction == "mul":
+        indices_t = indices.T
+        for i in range(indices_t.shape[0]):
+            idx = tuple(indices_t[i])
+            outputs[idx] = outputs[idx] * updates[i]
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    return outputs
 
 
 def slice(inputs, start_indices, shape):
-    shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
+
+    # Fast path: when both start_indices and shape are Python int sequences,
+    # build the slice objects directly. This avoids creating tensors from
+    # the indices, which would introduce data-dependent expressions that
+    # torch.export cannot trace.
+    if isinstance(start_indices, (list, tuple)) and isinstance(
+        shape, (list, tuple)
+    ):
+        if all(
+            isinstance(s, (int, torch.SymInt)) for s in start_indices
+        ) and all(isinstance(s, (int, torch.SymInt)) for s in shape):
+            slices = [
+                builtins.slice(start_index, start_index + length)
+                for start_index, length in zip(start_indices, shape)
+            ]
+            return inputs[tuple(slices)]
+
+    # Slow path: tensor-based slicing via torch.narrow for truly dynamic
+    # indices. torch.narrow is a proper ATen op that torch.export can
+    # trace, unlike Python-level iteration over tensor elements.
+    shape_dtype = to_torch_dtype("int64")
     start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     shape = convert_to_tensor(shape).to(shape_dtype)
-
-    python_slice = __builtins__["slice"]
-    slices = [
-        python_slice(start_index, start_index + length)
-        for start_index, length in zip(start_indices, shape)
-    ]
-    return inputs[slices]
+    result = inputs
+    for dim in range(start_indices.shape[0]):
+        result = torch.narrow(result, dim, start_indices[dim], shape[dim])
+    return result
 
 
 def slice_update(inputs, start_indices, updates):
-    shape_dtype = to_torch_dtype("int64")
     inputs = convert_to_tensor(inputs)
-    start_indices = convert_to_tensor(start_indices).to(shape_dtype)
     updates = convert_to_tensor(updates)
 
-    python_slice = __builtins__["slice"]
-    slices = [
-        python_slice(start_index, start_index + update_length)
-        for start_index, update_length in zip(start_indices, updates.shape)
-    ]
-    outputs = torch.clone(inputs)
-    outputs[slices] = updates
+    # Fast path: when start_indices is a Python int sequence, use it
+    # directly. This avoids creating tensors from the indices, which would
+    # introduce data-dependent expressions that torch.export cannot trace.
+    if isinstance(start_indices, (list, tuple)) and all(
+        isinstance(s, int) for s in start_indices
+    ):
+        slices = [
+            builtins.slice(start_index, start_index + update_length)
+            for start_index, update_length in zip(start_indices, updates.shape)
+        ]
+        outputs = torch.clone(inputs)
+        outputs[tuple(slices)] = updates
+        return outputs
+
+    # Slow path: tensor-based start_indices.
+    # We cannot use Python slice objects because they require scalar int
+    # bounds, and extracting scalars from traced tensors creates unbacked
+    # symbols that torch.export cannot resolve.
+    # We also cannot use `torch.narrow` (as the `slice` slow-path does)
+    # because `narrow` is read-only; for in-place updates we need
+    # `index_put_`, which is fully traceable.
+    start_indices = convert_to_tensor(start_indices, dtype="int64")
+    outputs = inputs.clone()
+    update_shape = list(updates.shape)
+    dims = len(update_shape)
+    indices_list = []
+    for dim in range(dims):
+        dim_indices = torch.arange(
+            update_shape[dim],
+            dtype=start_indices.dtype,
+            device=start_indices.device,
+        )
+        dim_indices = dim_indices + start_indices[dim]
+        indices_list.append(dim_indices)
+
+    grids = torch.meshgrid(*indices_list, indexing="ij")
+    flat_indices = [g.flatten() for g in grids]
+    outputs.index_put_(tuple(flat_indices), updates.flatten())
     return outputs
+
+
+def switch(index, branches, *operands):
+    index = convert_to_tensor(index, "int32")
+    index = torch.clamp(index, 0, len(branches) - 1)
+    return branches[index](*operands)
 
 
 def while_loop(
@@ -452,8 +729,8 @@ def while_loop(
     maximum_iterations=None,
 ):
     current_iter = 0
-    iteration_check = (
-        lambda iter: maximum_iterations is None or iter < maximum_iterations
+    iteration_check = lambda iter: (
+        maximum_iterations is None or iter < maximum_iterations
     )
     is_tuple = isinstance(loop_vars, (tuple, list))
     loop_vars = tuple(loop_vars) if is_tuple else (loop_vars,)
@@ -475,6 +752,8 @@ def fori_loop(lower, upper, body_fun, init_val):
 
 
 def stop_gradient(variable):
+    if isinstance(variable, Variable):
+        variable = variable.value
     # We can't use `.requires_grad_(False)` here since it only
     # works when the tensor is a leaf node in the graph.
     return variable.detach()
@@ -482,6 +761,31 @@ def stop_gradient(variable):
 
 def unstack(x, num=None, axis=0):
     return x.unbind(axis)
+
+
+def random_seed_dtype():
+    # uint32 doesn't exist in torch. Seeds are conceptually uint32 values;
+    # int32 is used and the bit pattern is reinterpreted as uint32 at each
+    # call site (torch_seed_generator / torch.manual_seed) via & 0xFFFFFFFF.
+    return "int32"
+
+
+def remat(f):
+    """Implementation of rematerialization.
+
+    Args:
+        f: The function or operation to rematerialize.
+    Returns:
+        A function wrapping f that defines a custom gradient, which
+        recomputes f on the backwards pass of a gradient call.
+    """
+
+    def wrapped(*args, **kwargs):
+        return torch.utils.checkpoint.checkpoint(
+            f, *args, use_reentrant=False, **kwargs
+        )
+
+    return wrapped
 
 
 class custom_gradient:

@@ -1,10 +1,11 @@
 import functools
+import math
 import operator
 import re
 import warnings
 
 
-def _convert_conv_tranpose_padding_args_from_keras_to_jax(
+def _convert_conv_transpose_padding_args_from_keras_to_jax(
     kernel_size, stride, dilation_rate, padding, output_padding
 ):
     """Convert the padding arguments from Keras to the ones used by JAX.
@@ -15,7 +16,11 @@ def _convert_conv_tranpose_padding_args_from_keras_to_jax(
     be given a default value.
     """
 
-    assert padding.lower() in {"valid", "same"}
+    if padding.lower() not in {"valid", "same"}:
+        raise ValueError(
+            f"The `padding` argument must be one of 'valid', 'same'. "
+            f"Received: padding={padding}"
+        )
     kernel_size = (kernel_size - 1) * dilation_rate + 1
 
     if padding.lower() == "valid":
@@ -45,7 +50,7 @@ def _convert_conv_tranpose_padding_args_from_keras_to_jax(
     return left_pad, right_pad
 
 
-def _convert_conv_tranpose_padding_args_from_keras_to_torch(
+def _convert_conv_transpose_padding_args_from_keras_to_torch(
     kernel_size, stride, dilation_rate, padding, output_padding
 ):
     """Convert the padding arguments from Keras to the ones used by Torch.
@@ -57,7 +62,11 @@ def _convert_conv_tranpose_padding_args_from_keras_to_torch(
     the case when both the Torch padding and output_padding values are
     strictly positive.
     """
-    assert padding.lower() in {"valid", "same"}
+    if padding.lower() not in {"valid", "same"}:
+        raise ValueError(
+            f"The `padding` argument must be one of 'valid', 'same'. "
+            f"Received: padding={padding}"
+        )
     original_kernel_size = kernel_size
     kernel_size = (kernel_size - 1) * dilation_rate + 1
 
@@ -96,13 +105,13 @@ def _convert_conv_tranpose_padding_args_from_keras_to_torch(
         )
 
     if torch_output_padding >= stride:
-        raise ValueError(
-            f"The padding arguments (padding={padding}) and "
-            f"output_padding={output_padding}) lead to a Torch "
-            f"output_padding ({torch_output_padding}) that is greater than "
-            f"strides ({stride}). This is not supported. You can change the "
-            f"padding arguments, kernel or stride, or run on another backend. "
+        warnings.warn(
+            f"Torch backend requires output_padding < stride. "
+            f"Clamping output_padding {torch_output_padding} -> {stride - 1} "
+            f"for stride {stride}.",
+            UserWarning,
         )
+        torch_output_padding = stride - 1
 
     return torch_padding, torch_output_padding
 
@@ -134,7 +143,7 @@ def compute_conv_transpose_padding_args_for_jax(
         (
             pad_left,
             pad_right,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_jax(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_jax(
             kernel_size=kernel_spatial_shape[i],
             stride=strides_i,
             dilation_rate=dilation_rate_i,
@@ -174,7 +183,7 @@ def compute_conv_transpose_padding_args_for_torch(
         (
             torch_padding,
             torch_output_padding,
-        ) = _convert_conv_tranpose_padding_args_from_keras_to_torch(
+        ) = _convert_conv_transpose_padding_args_from_keras_to_torch(
             kernel_size=kernel_spatial_shape[i],
             stride=strides_i,
             dilation_rate=dilation_rate_i,
@@ -184,7 +193,79 @@ def compute_conv_transpose_padding_args_for_torch(
         torch_paddings.append(torch_padding)
         torch_output_paddings.append(torch_output_padding)
 
+    # --- FIX FOR TORCH CONSTRAINT: output_padding < stride ---
+    corrected_output_paddings = []
+    for s, op in zip(
+        strides
+        if isinstance(strides, (list, tuple))
+        else [strides] * num_spatial_dims,
+        torch_output_paddings,
+    ):
+        max_allowed = max(0, s - 1)
+        if op > max_allowed:
+            corrected_output_paddings.append(max_allowed)
+        else:
+            corrected_output_paddings.append(op)
+
+    torch_output_paddings = corrected_output_paddings
+
     return torch_paddings, torch_output_paddings
+
+
+def compute_conv_transpose_output_crops_for_torch(
+    input_shape,
+    kernel_shape,
+    strides,
+    padding,
+    output_padding,
+    dilation_rate,
+):
+    """Per-spatial-dim asymmetric (left, right) crop amounts for torch.
+
+    Torch's `conv_transpose*d` only supports symmetric `padding` plus a
+    right-side `output_padding`, which cannot express the asymmetric crops
+    that Keras "same" semantics requires when stride > 1 with an odd kernel.
+    We work around this by calling torch with `padding=0, output_padding=0`
+    (which produces the largest "natural" output of size
+    `(input - 1) * stride + effective_kernel`), then asymmetrically slicing
+    the spatial dims to the same window JAX would compute.
+
+    The slice on each side is `(effective_kernel - 1) - left_pad` from the
+    left and `(effective_kernel - 1) - right_pad` from the right, where
+    `left_pad` / `right_pad` come from the existing JAX helper. A negative
+    value means we need to extend with zero-padding instead of cropping.
+    """
+    num_spatial_dims = len(input_shape) - 2
+    kernel_spatial_shape = kernel_shape[:-2]
+
+    crops = []
+    for i in range(num_spatial_dims):
+        output_padding_i = (
+            output_padding
+            if output_padding is None or isinstance(output_padding, int)
+            else output_padding[i]
+        )
+        strides_i = strides if isinstance(strides, int) else strides[i]
+        dilation_rate_i = (
+            dilation_rate
+            if isinstance(dilation_rate, int)
+            else dilation_rate[i]
+        )
+        (
+            left_pad,
+            right_pad,
+        ) = _convert_conv_transpose_padding_args_from_keras_to_jax(
+            kernel_size=kernel_spatial_shape[i],
+            stride=strides_i,
+            dilation_rate=dilation_rate_i,
+            padding=padding,
+            output_padding=output_padding_i,
+        )
+        effective_kernel = (kernel_spatial_shape[i] - 1) * dilation_rate_i + 1
+        crop_left = (effective_kernel - 1) - left_pad
+        crop_right = (effective_kernel - 1) - right_pad
+        crops.append((crop_left, crop_right))
+    return crops
 
 
 def _get_output_shape_given_tf_padding(
@@ -193,7 +274,11 @@ def _get_output_shape_given_tf_padding(
     if input_size is None:
         return None
 
-    assert padding.lower() in {"valid", "same"}
+    if padding.lower() not in {"valid", "same"}:
+        raise ValueError(
+            f"The `padding` argument must be one of 'valid', 'same'. "
+            f"Received: padding={padding}"
+        )
 
     kernel_size = (kernel_size - 1) * dilation_rate + 1
 
@@ -273,15 +358,75 @@ def canonicalize_axis(axis, num_dims):
     return axis
 
 
+def canonicalize_axes(axis, num_dims):
+    """Canonicalize an axis or axes to a tuple of non-negative integers."""
+    if isinstance(axis, (tuple, list)):
+        return tuple(canonicalize_axis(a, num_dims) for a in axis)
+    return (canonicalize_axis(axis, num_dims),)
+
+
 def standardize_axis_for_numpy(axis):
     """Standardize an axis to a tuple if it is a list in the numpy backend."""
     return tuple(axis) if isinstance(axis, list) else axis
+
+
+def check_conv_input_channels(inputs, kernel, data_format):
+    """Validate a conv input against its kernel shape.
+
+    Used by `conv`, `depthwise_conv`, and `separable_conv` — all share the
+    convention that the kernel's input-channel dimension is `kernel.shape[-2]`.
+    Produces a clear error message before the backend op raises its own
+    implementation-specific one.
+    """
+    input_channels = (
+        inputs.shape[-1] if data_format == "channels_last" else inputs.shape[1]
+    )
+    kernel_input_channels = kernel.shape[-2]
+    # Only validate when both dimensions are concrete Python ints. Dynamic
+    # dimensions can come in forms other than `None` during tracing.
+    if (
+        isinstance(input_channels, int)
+        and isinstance(kernel_input_channels, int)
+        and input_channels != kernel_input_channels
+    ):
+        raise ValueError(
+            "The number of input channels must match the kernel's input "
+            f"channels. Received: input channels={input_channels}, kernel "
+            f"input channels={kernel_input_channels}, "
+            f"data_format='{data_format}'."
+        )
+
+
+def check_conv_transpose_input_channels(inputs, kernel, data_format):
+    """Validate a conv_transpose input against its kernel shape.
+
+    `conv_transpose` kernels use the layout
+    `(spatial..., out_channels, in_channels)`, so the input-channel dimension
+    is at `kernel.shape[-1]` (vs. `kernel.shape[-2]` for regular conv).
+    """
+    input_channels = (
+        inputs.shape[-1] if data_format == "channels_last" else inputs.shape[1]
+    )
+    kernel_input_channels = kernel.shape[-1]
+    if (
+        isinstance(input_channels, int)
+        and isinstance(kernel_input_channels, int)
+        and input_channels != kernel_input_channels
+    ):
+        raise ValueError(
+            "The number of input channels must match the kernel's input "
+            f"channels. Received: input channels={input_channels}, kernel "
+            f"input channels={kernel_input_channels}, "
+            f"data_format='{data_format}'."
+        )
 
 
 def to_tuple_or_list(value):
     """Convert the non-`None` value to either a tuple or a list."""
     if value is None:
         return value
+    if hasattr(value, "tolist"):  # e.g. numpy array or scalar
+        value = value.tolist()
     if not isinstance(value, (int, tuple, list)):
         raise ValueError(
             "`value` must be an integer, tuple or list. "
@@ -290,6 +435,27 @@ def to_tuple_or_list(value):
     if isinstance(value, int):
         return (value,)
     return value
+
+
+def normalize_shift_and_axis(shift, axis):
+    """Normalize `shift` and `axis` arguments of `roll` to the same length.
+
+    Mirrors numpy's behavior of broadcasting a scalar (or length-1
+    sequence) `shift`/`axis` against the other argument. Accepts ints,
+    lists, tuples, and array-likes (e.g. numpy arrays).
+    """
+    shifts = list(to_tuple_or_list(shift))
+    axes = list(to_tuple_or_list(axis))
+    if len(shifts) == 1:
+        shifts = shifts * len(axes)
+    if len(axes) == 1:
+        axes = axes * len(shifts)
+    if len(shifts) != len(axes):
+        raise ValueError(
+            "`shift` and `axis` must be broadcastable to the same length. "
+            f"Received: shift={shift}, axis={axis}"
+        )
+    return shifts, axes
 
 
 ### Code for ops.vectorize() used for TF and torch backends.
@@ -356,7 +522,7 @@ def _vectorize_parse_input_dimensions(
             f"expected {len(input_core_dims)}, got {len(args)}"
         )
     shapes = []
-    dim_sizes: dict[str, int] = {}
+    dim_sizes = {}
     for arg, core_dims in zip(args, input_core_dims):
         _vectorize_update_dim_sizes(
             dim_sizes, arg.shape, core_dims, is_input=True
@@ -511,3 +677,22 @@ def vectorize_impl(pyfunc, vmap_fn, *, excluded=None, signature=None):
             return ops.expand_dims(result, axis=dims_to_expand)
 
     return wrapped
+
+
+def slice_along_axis(x, start=0, stop=None, step=1, axis=0):
+    """Slice a Tensor along the given axis."""
+    # Ref: same util function defined in tfp.math.scan_associative
+    if axis >= 0:
+        slices = [slice(None)] * axis + [slice(start, stop, step)]
+    else:
+        slices = [Ellipsis, slice(start, stop, step)] + [slice(None)] * (
+            -1 - axis
+        )
+    return x[tuple(slices)]
+
+
+def compute_adaptive_pooling_window_sizes(input_dim, output_dim):
+    """Compute small and big window sizes for adaptive pooling."""
+    small = math.ceil(input_dim / output_dim)
+    big = small + 1
+    return small, big

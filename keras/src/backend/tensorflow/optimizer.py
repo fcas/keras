@@ -1,26 +1,44 @@
+"""A class for Tensorflow specific optimizer logic.
+
+The major behavior change for this class is for tf.distribute.
+
+It will override methods from base Keras core Optimizer,
+which provide distribute specific functionality, e.g. variable
+creation, loss reduction, etc.
+"""
+
 import warnings
 
 import tensorflow as tf
 
 from keras.src import backend
-from keras.src.backend.common import KerasVariable
 from keras.src.backend.tensorflow.trackable import KerasAutoTrackable
 from keras.src.optimizers import base_optimizer
 
 
 class TFOptimizer(KerasAutoTrackable, base_optimizer.BaseOptimizer):
-    """A class for Tensorflow specific optimizer logic.
-
-    The major behavior change for this class is for tf.distribute.
-
-    It will override methods from base Keras core Optimizer,
-    which provide distribute specific functionality, e.g. variable
-    creation, loss reduction, etc.
-    """
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._distribution_strategy = tf.distribute.get_strategy()
+
+    def add_variable(
+        self,
+        shape,
+        initializer="zeros",
+        dtype=None,
+        aggregation="none",
+        layout=None,
+        name=None,
+    ):
+        with tf.init_scope():
+            return super().add_variable(
+                shape,
+                initializer=initializer,
+                dtype=dtype,
+                aggregation=aggregation,
+                layout=layout,
+                name=name,
+            )
 
     def add_variable_from_reference(
         self, reference_variable, name=None, initializer="zeros"
@@ -46,7 +64,7 @@ class TFOptimizer(KerasAutoTrackable, base_optimizer.BaseOptimizer):
         )
 
     def assign(self, variable, value):
-        if isinstance(variable, KerasVariable):
+        if isinstance(variable, backend.Variable):
             variable = variable.value
         value = tf.cast(value, variable.dtype)
         if isinstance(value, tf.IndexedSlices):
@@ -55,7 +73,7 @@ class TFOptimizer(KerasAutoTrackable, base_optimizer.BaseOptimizer):
             variable.assign(value)
 
     def assign_add(self, variable, value):
-        if isinstance(variable, KerasVariable):
+        if isinstance(variable, backend.Variable):
             variable = variable.value
         value = tf.cast(value, variable.dtype)
         if isinstance(value, tf.IndexedSlices):
@@ -64,7 +82,7 @@ class TFOptimizer(KerasAutoTrackable, base_optimizer.BaseOptimizer):
             variable.assign_add(value)
 
     def assign_sub(self, variable, value):
-        if isinstance(variable, KerasVariable):
+        if isinstance(variable, backend.Variable):
             variable = variable.value
         value = tf.cast(value, variable.dtype)
         if isinstance(value, tf.IndexedSlices):
@@ -116,18 +134,18 @@ class TFOptimizer(KerasAutoTrackable, base_optimizer.BaseOptimizer):
             v.value if isinstance(v, backend.Variable) else v
             for v in trainable_variables
         ]
+        grads_and_vars = list(zip(grads, trainable_variables))
+        grads_and_vars = self._all_reduce_sum_gradients(grads_and_vars)
         tf.__internal__.distribute.interim.maybe_merge_call(
             self._distributed_tf_update_step,
             self._distribution_strategy,
-            list(zip(grads, trainable_variables)),
+            grads_and_vars,
             learning_rate,
         )
 
     def _distributed_tf_update_step(
         self, distribution, grads_and_vars, learning_rate
     ):
-        grads_and_vars = self._all_reduce_sum_gradients(grads_and_vars)
-
         def apply_grad_to_update_var(var, grad, learning_rate):
             return self.update_step(grad, var, learning_rate)
 
@@ -171,7 +189,12 @@ class TFOptimizer(KerasAutoTrackable, base_optimizer.BaseOptimizer):
             else:
                 reduced_with_nones.append((reduced[reduced_pos], v))
                 reduced_pos += 1
-        assert reduced_pos == len(reduced), "Failed to add all gradients"
+        if reduced_pos != len(reduced):
+            raise ValueError(
+                "Internal error: Failed to add all gradients. Expected to "
+                f"process {len(reduced)} gradients, but processed "
+                f"{reduced_pos}."
+            )
         return reduced_with_nones
 
     def _overwrite_model_variables_with_average_value(

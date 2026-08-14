@@ -7,8 +7,12 @@ from keras.src.backend.torch.core import cast
 from keras.src.backend.torch.core import convert_to_tensor
 
 
-def cholesky(x):
-    return torch.linalg.cholesky(x)
+def cholesky(x, upper=False):
+    return torch.linalg.cholesky(x, upper=upper)
+
+
+def cholesky_inverse(x, upper=False):
+    return torch.cholesky_inverse(x, upper=upper)
 
 
 def det(x):
@@ -29,7 +33,7 @@ def inv(x):
 
 def lu_factor(x):
     LU, pivots = torch.linalg.lu_factor(x)
-    # torch retuns pivots with 1-based indexing
+    # torch returns pivots with 1-based indexing
     return LU, pivots - 1
 
 
@@ -68,13 +72,45 @@ def solve_triangular(a, b, lower=False):
 
 def svd(x, full_matrices=True, compute_uv=True):
     if not compute_uv:
-        raise NotImplementedError(
-            "`compute_uv=False` is not supported for torch backend."
-        )
+        return torch.linalg.svdvals(x)
     return torch.linalg.svd(x, full_matrices=full_matrices)
 
 
 def lstsq(a, b, rcond=None):
     a = convert_to_tensor(a)
     b = convert_to_tensor(b)
+    # `torch.linalg.lstsq` defaults to the QR-based `gelsy` driver on CPU,
+    # which interprets `rcond` differently from numpy and can return
+    # large errors on near-rank-deficient inputs. Pin the SVD-based
+    # `gelsd` driver when an explicit `rcond` is supplied so the result
+    # matches numpy's `linalg.lstsq` semantics. CUDA only supports the
+    # `gels` driver, which has no rcond cutoff, so fall back to SVD via
+    # `pinv` to match numpy semantics there.
+    if rcond is not None:
+        if a.device.type == "cuda":
+            return torch.linalg.pinv(a, rtol=rcond) @ b
+        return torch.linalg.lstsq(a, b, rcond=rcond, driver="gelsd")[0]
     return torch.linalg.lstsq(a, b, rcond=rcond)[0]
+
+
+def matrix_rank(x, tol=None):
+    x = convert_to_tensor(x)
+    # `torch.linalg.matrix_rank` uses `atol` for the absolute threshold
+    # that numpy's `tol` also represents.
+    return torch.linalg.matrix_rank(x, atol=tol).to(torch.int32)
+
+
+def matrix_power(a, n):
+    a = convert_to_tensor(a)
+    return torch.linalg.matrix_power(a, n)
+
+
+def pinv(x, rcond=None):
+    x = convert_to_tensor(x)
+    # `torch.linalg.pinv` expresses the threshold as `rtol` (relative
+    # tolerance), with the same meaning as numpy's `rcond`.
+    return torch.linalg.pinv(x, rtol=rcond)
+
+
+def jvp(fun, primals, tangents, has_aux=False):
+    return torch.func.jvp(fun, primals, tangents, has_aux=has_aux)

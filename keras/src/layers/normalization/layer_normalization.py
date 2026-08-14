@@ -1,8 +1,11 @@
+import warnings
+
 from keras.src import constraints
 from keras.src import initializers
 from keras.src import ops
 from keras.src import regularizers
 from keras.src.api_export import keras_export
+from keras.src.backend.common.backend_utils import canonicalize_axes
 from keras.src.layers.layer import Layer
 
 
@@ -82,10 +85,6 @@ class LayerNormalization(Layer):
             When the next layer is linear (also e.g. `nn.relu`), this can be
             disabled since the scaling will be done by the next layer.
             Defaults to `True`.
-        rms_scaling: If True, `center` and `scale` are ignored, and the
-            inputs are scaled by `gamma` and the inverse square root
-            of the square of all inputs. This is an approximate and faster
-            approach that avoids ever computing the mean of the input.
         beta_initializer: Initializer for the beta weight. Defaults to zeros.
         gamma_initializer: Initializer for the gamma weight. Defaults to ones.
         beta_regularizer: Optional regularizer for the beta weight.
@@ -110,15 +109,23 @@ class LayerNormalization(Layer):
         epsilon=1e-3,
         center=True,
         scale=True,
-        rms_scaling=False,
         beta_initializer="zeros",
         gamma_initializer="ones",
         beta_regularizer=None,
         gamma_regularizer=None,
         beta_constraint=None,
         gamma_constraint=None,
-        **kwargs
+        **kwargs,
     ):
+        rms_scaling = kwargs.pop("rms_scaling", False)
+        if rms_scaling:
+            warnings.warn(
+                "You passed `rms_scaling=True`, which is deprecated. This "
+                "argument incorrectly scales the input by the variance, not "
+                "the root mean square. To correctly use RMS Normalization, "
+                "please use `keras.layers.RMSNormalization` instead."
+            )
+
         super().__init__(**kwargs)
         if isinstance(axis, (list, tuple)):
             self.axis = list(axis)
@@ -145,11 +152,13 @@ class LayerNormalization(Layer):
         self.autocast = False
 
     def build(self, input_shape):
-        if isinstance(self.axis, list):
-            shape = tuple([input_shape[dim] for dim in self.axis])
-        else:
-            shape = (input_shape[self.axis],)
-            self.axis = [self.axis]
+        axes = canonicalize_axes(self.axis, len(input_shape))
+        if len(set(axes)) != len(axes):
+            raise ValueError(
+                f"Duplicate axes are not allowed. Received: axis={self.axis}"
+            )
+        self.axis = sorted(axes)
+        shape = tuple(input_shape[dim] for dim in self.axis)
         if self.scale or self.rms_scaling:
             self.gamma = self.add_weight(
                 name="gamma",
@@ -176,65 +185,19 @@ class LayerNormalization(Layer):
         else:
             self.beta = None
 
-        self.built = True
-
     def call(self, inputs):
-        inputs = ops.cast(inputs, self.compute_dtype)
-        # Compute the axes along which to reduce the mean / variance
-        input_shape = inputs.shape
-        ndims = len(input_shape)
-
-        # Broadcasting only necessary for norm when the axis is not just
-        # the last dimension
-        broadcast_shape = [1] * ndims
-        for dim in self.axis:
-            broadcast_shape[dim] = input_shape[dim]
-
-        def _broadcast(v):
-            if (
-                v is not None
-                and len(v.shape) != ndims
-                and self.axis != [ndims - 1]
-            ):
-                return ops.reshape(v, broadcast_shape)
-            return v
-
-        input_dtype = inputs.dtype
-        if input_dtype in ("float16", "bfloat16") and self.dtype == "float32":
-            # If mixed precision is used, cast inputs to float32 so that
-            # this is at least as numerically stable as the fused version.
-            inputs = ops.cast(inputs, "float32")
-
-        if self.rms_scaling:
-            # Calculate outputs with only variance and gamma if rms scaling
-            # is enabled
-            # Calculate the variance along self.axis (layer activations).
-            variance = ops.var(inputs, axis=self.axis, keepdims=True)
-            inv = ops.rsqrt(variance + self.epsilon)
-
-            outputs = (
-                inputs * inv * ops.cast(_broadcast(self.gamma), inputs.dtype)
-            )
-        else:
-            # Calculate the mean & variance along self.axis (layer activations).
-            mean, variance = ops.moments(inputs, axes=self.axis, keepdims=True)
-            gamma, beta = _broadcast(self.gamma), _broadcast(self.beta)
-
-            inv = ops.rsqrt(variance + self.epsilon)
-            if gamma is not None:
-                gamma = ops.cast(gamma, inputs.dtype)
-                inv = inv * gamma
-
-            res = -mean * inv
-            if beta is not None:
-                beta = ops.cast(beta, inputs.dtype)
-                res = res + beta
-
-            outputs = inputs * inv + res
-
-        return ops.cast(outputs, input_dtype)
+        outputs = ops.layer_normalization(
+            inputs,
+            self.gamma,
+            self.beta,
+            self.axis,
+            self.epsilon,
+            rms_scaling=self.rms_scaling,
+        )
+        return ops.cast(outputs, self.compute_dtype)
 
     def compute_output_shape(self, input_shape):
+        canonicalize_axes(self.axis, len(input_shape))
         return input_shape
 
     def get_config(self):
@@ -243,6 +206,7 @@ class LayerNormalization(Layer):
             "epsilon": self.epsilon,
             "center": self.center,
             "scale": self.scale,
+            "rms_scaling": self.rms_scaling,
             "beta_initializer": initializers.serialize(self.beta_initializer),
             "gamma_initializer": initializers.serialize(self.gamma_initializer),
             "beta_regularizer": regularizers.serialize(self.beta_regularizer),

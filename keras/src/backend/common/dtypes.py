@@ -17,6 +17,7 @@ INT_TYPES = (
 )
 FLOAT_TYPES = ("bfloat16", "float16", "float32", "float64")
 WEAK_TYPES = ("int", "float")
+COMPLEX_TYPES = ("complex64", "complex128")
 # We need to separate float8 from float because there are no implicit
 # conversions from float8 dtypes to other dtypes.
 # Ref: https://github.com/google/jax/issues/16705
@@ -40,6 +41,8 @@ ALLOWED_DTYPES = (
     "string",
     "float8_e4m3fn",
     "float8_e5m2",
+    "complex64",
+    "complex128",
 )
 PYTHON_DTYPES_MAP = {
     bool: "bool",
@@ -48,6 +51,7 @@ PYTHON_DTYPES_MAP = {
     str: "string",
     # special case for string value
     "int": "int64" if config.backend() == "tensorflow" else "int32",
+    complex: "complex128" if config.backend() == "tensorflow" else "complex64",
 }
 
 # We adapted the type promotion lattice from JAX. Ref:
@@ -63,13 +67,14 @@ def _type_promotion_lattice():
     (u1, u2, u4, u8, i1, i2, i4, i8) = INT_TYPES
     bf, f2, f4, f8 = FLOAT_TYPES
     i_, f_ = WEAK_TYPES
+    c64, c128 = COMPLEX_TYPES
     out = {
         b1: [i_],
         u1: [i2, u2],
         u2: [i4, u4],
         u4: [i8, u8],
         u8: [f_],
-        i_: [u1, i1],
+        i_: [u1, i1, c64],
         i1: [i2],
         i2: [i4],
         i4: [i8],
@@ -77,8 +82,10 @@ def _type_promotion_lattice():
         f_: [bf, f2],
         bf: [f4],
         f2: [f4],
-        f4: [f8],
-        f8: [],
+        f4: [f8, c64],
+        f8: [c128],
+        c64: [c128],
+        c128: [],
     }
     return out
 
@@ -186,6 +193,8 @@ def _respect_weak_type(dtype, weak_type):
             return "float"
         elif "int" in dtype:
             return "int"
+        elif "complex" in dtype:
+            return "complex"
         else:
             raise ValueError(
                 "Invalid value for argument `dtype`. Expected one of "
@@ -216,25 +225,20 @@ def _resolve_weak_type(dtype, precision="32"):
     if dtype_indicator == "b":
         return "bool"
     elif dtype_indicator == "i":
-        return "int" + precision
+        return f"int{precision}"
     elif dtype_indicator == "u":
-        return "uint" + precision
+        return f"uint{precision}"
     else:
-        return "float" + precision
+        return f"float{precision}"
 
 
-BIT64_TO_BIT16_DTYPE = {
-    "int32": "int16",
-    "int64": "int16",
-    "uint32": "uint16",
-    "uint64": "uint16",
-    "float32": "float16",
-    "float64": "float16",
-}
 BIT64_TO_BIT32_DTYPE = {
-    "int64": "int32",
+    # Since TF variables require int64 to be placed on the GPU, we exclusively
+    # enable the int64 dtype for TF.
+    "int64": "int64" if config.backend() == "tensorflow" else "int32",
     "uint64": "uint32",
-    "float64": "float32",
+    "float64": "float64" if config.backend() == "tensorflow" else "float32",
+    "complex128": "complex64",
 }
 
 
@@ -266,6 +270,10 @@ def _lattice_result_type(*args):
     precision = config.floatx()[-2:]
     if out_weak_type:
         out_dtype = _resolve_weak_type(out_dtype, precision=precision)
+
+    # Force to be 32-bit dtype when encountering 64-bit dtype. This is to
+    # be aligned with JAX's default behavior.
+    out_dtype = BIT64_TO_BIT32_DTYPE.get(out_dtype, out_dtype)
     return out_dtype
 
 
@@ -295,6 +303,11 @@ def result_type(*dtypes):
     >>> y = keras.ops.ones((1,), dtype="float32")
     >>> keras.backend.result_type(x.dtype, y.dtype)
     "float32"
+
+    >>> z= keras.ops.ones((1,), dtype='complex64')
+    >>> keras.backend.result_type(z.dtype, int)
+    "float64"
+
     """
     if len(dtypes) == 0:
         # If no dtypes provided, default to floatx, this matches

@@ -130,6 +130,14 @@ class ConvLSTMCell(Layer, DropoutRNNCell):
         self.dilation_rate = argument_validation.standardize_tuple(
             dilation_rate, self.rank, "dilation_rate"
         )
+        if max(self.strides) > 1 and max(self.dilation_rate) > 1:
+            raise ValueError(
+                "Specifying `strides > 1` is not compatible with "
+                "`dilation_rate > 1`. Please provide `strides=1` or "
+                "`dilation_rate=1`. "
+                f"Received: strides={self.strides} and "
+                f"dilation_rate={self.dilation_rate}"
+            )
         self.activation = activations.get(activation)
         self.recurrent_activation = activations.get(recurrent_activation)
         self.use_bias = use_bias
@@ -149,6 +157,7 @@ class ConvLSTMCell(Layer, DropoutRNNCell):
 
         self.dropout = min(1.0, max(0.0, dropout))
         self.recurrent_dropout = min(1.0, max(0.0, recurrent_dropout))
+        self.dropout_mask_count = 4
         self.input_spec = InputSpec(ndim=rank + 2)
         self.state_size = -1  # Custom, defined in methods
 
@@ -227,29 +236,34 @@ class ConvLSTMCell(Layer, DropoutRNNCell):
             )
         else:
             self.bias = None
-        self.built = True
 
     def call(self, inputs, states, training=False):
         h_tm1 = states[0]  # previous memory state
         c_tm1 = states[1]  # previous carry state
 
-        # dp_mask = self.get_dropout_mask(inputs)
-        # rec_dp_mask = self.get_recurrent_dropout_mask(h_tm1)
+        if training and 0.0 < self.dropout < 1.0:
+            dp_mask = self.get_dropout_mask(inputs)
+            inputs_i = inputs * dp_mask[0]
+            inputs_f = inputs * dp_mask[1]
+            inputs_c = inputs * dp_mask[2]
+            inputs_o = inputs * dp_mask[3]
+        else:
+            inputs_i = inputs
+            inputs_f = inputs
+            inputs_c = inputs
+            inputs_o = inputs
 
-        # if training and 0.0 < self.dropout < 1.0:
-        #     inputs *= dp_mask
-        # if training and 0.0 < self.recurrent_dropout < 1.0:
-        #     h_tm1 *= rec_dp_mask
-
-        inputs_i = inputs
-        inputs_f = inputs
-        inputs_c = inputs
-        inputs_o = inputs
-
-        h_tm1_i = h_tm1
-        h_tm1_f = h_tm1
-        h_tm1_c = h_tm1
-        h_tm1_o = h_tm1
+        if training and 0.0 < self.recurrent_dropout < 1.0:
+            rec_dp_mask = self.get_recurrent_dropout_mask(h_tm1)
+            h_tm1_i = h_tm1 * rec_dp_mask[0]
+            h_tm1_f = h_tm1 * rec_dp_mask[1]
+            h_tm1_c = h_tm1 * rec_dp_mask[2]
+            h_tm1_o = h_tm1 * rec_dp_mask[3]
+        else:
+            h_tm1_i = h_tm1
+            h_tm1_f = h_tm1
+            h_tm1_c = h_tm1
+            h_tm1_o = h_tm1
 
         (kernel_i, kernel_f, kernel_c, kernel_o) = ops.split(
             self.kernel, 4, axis=self.rank + 1

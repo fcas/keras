@@ -1,5 +1,5 @@
-import collections
 import itertools
+import warnings
 from functools import partial
 
 import jax
@@ -9,13 +9,23 @@ from keras.src import backend
 from keras.src import callbacks as callbacks_module
 from keras.src import optimizers as optimizers_module
 from keras.src import tree
+from keras.src.backend import config
 from keras.src.backend import distribution_lib as jax_distribution_lib
+from keras.src.backend.config import is_nnx_enabled
 from keras.src.distribution import distribution_lib
 from keras.src.trainers import trainer as base_trainer
 from keras.src.trainers.data_adapters import array_slicing
 from keras.src.trainers.data_adapters import data_adapter_utils
 from keras.src.trainers.epoch_iterator import EpochIterator
 from keras.src.utils import traceback_utils
+from keras.src.utils.python_utils import pythonify_logs
+
+if is_nnx_enabled():
+    from flax import nnx
+
+    jit = nnx.jit
+else:
+    jit = jax.jit
 
 
 class JAXTrainer(base_trainer.Trainer):
@@ -63,6 +73,7 @@ class JAXTrainer(base_trainer.Trainer):
             y=y,
             y_pred=y_pred,
             sample_weight=sample_weight,
+            training=training,
         )
         if losses:
             self._losses_override.clear()
@@ -83,6 +94,31 @@ class JAXTrainer(base_trainer.Trainer):
             non_trainable_variables,
             metrics_variables,
         )
+
+    def _update_metrics_variables(
+        self, metrics_variables, unscaled_loss, x, y, y_pred, sample_weight
+    ):
+        with backend.StatelessScope(
+            state_mapping=[
+                (ref_v, v)
+                for ref_v, v in zip(self.metrics_variables, metrics_variables)
+            ]
+        ) as scope:
+            self._loss_tracker.update_state(
+                unscaled_loss,
+                sample_weight=next(
+                    i for i in tree.flatten(x) if i is not None
+                ).shape[0],
+            )
+            logs = self.compute_metrics(x, y, y_pred, sample_weight)
+
+        new_metrics_variables = []
+        for ref_v in self.metrics_variables:
+            new_v = scope.get_current_value(ref_v)
+            if new_v is None:
+                new_v = ref_v.value
+            new_metrics_variables.append(new_v)
+        return logs, new_metrics_variables
 
     def train_step(self, state, data):
         (
@@ -116,26 +152,11 @@ class JAXTrainer(base_trainer.Trainer):
             optimizer_variables, grads, trainable_variables
         )
 
-        with backend.StatelessScope(
-            state_mapping=[
-                (ref_v, v)
-                for ref_v, v in zip(self.metrics_variables, metrics_variables)
-            ]
-        ) as scope:
-            self._loss_tracker.update_state(
-                unscaled_loss, sample_weight=tree.flatten(x)[0].shape[0]
-            )
-            logs = self.compute_metrics(x, y, y_pred, sample_weight)
+        logs, metrics_variables = self._update_metrics_variables(
+            metrics_variables, unscaled_loss, x, y, y_pred, sample_weight
+        )
 
-        new_metrics_variables = []
-        for ref_v in self.metrics_variables:
-            new_v = scope.get_current_value(ref_v)
-            if new_v is None:
-                new_v = ref_v.value
-            new_metrics_variables.append(new_v)
-        metrics_variables = new_metrics_variables
-
-        state = self._enforce_jax_state_sharding(
+        state = (
             trainable_variables,
             non_trainable_variables,
             optimizer_variables,
@@ -163,36 +184,10 @@ class JAXTrainer(base_trainer.Trainer):
             aux
         )
 
-        with backend.StatelessScope(
-            state_mapping=[
-                (ref_v, v)
-                for ref_v, v in zip(self.metrics_variables, metrics_variables)
-            ]
-        ) as scope:
-            self._loss_tracker.update_state(
-                unscaled_loss, sample_weight=tree.flatten(x)[0].shape[0]
-            )
-            logs = self.compute_metrics(x, y, y_pred, sample_weight)
-
-        new_metrics_variables = []
-        for ref_v in self.metrics_variables:
-            new_v = scope.get_current_value(ref_v)
-            if new_v is None:
-                new_v = ref_v.value
-            new_metrics_variables.append(new_v)
-        metrics_variables = new_metrics_variables
-
-        (
-            trainable_variables,
-            non_trainable_variables,
-            _,
-            metrics_variables,
-        ) = self._enforce_jax_state_sharding(
-            trainable_variables=trainable_variables,
-            non_trainable_variables=non_trainable_variables,
-            optimizer_variables=None,
-            metrics_variables=metrics_variables,
+        logs, metrics_variables = self._update_metrics_variables(
+            metrics_variables, unscaled_loss, x, y, y_pred, sample_weight
         )
+
         state = (
             trainable_variables,
             non_trainable_variables,
@@ -210,121 +205,158 @@ class JAXTrainer(base_trainer.Trainer):
         outputs, non_trainable_variables = self.stateless_call(
             trainable_variables, non_trainable_variables, x, **kwargs
         )
-        (
-            _,
-            non_trainable_variables,
-            _,
-            _,
-        ) = self._enforce_jax_state_sharding(
-            trainable_variables=None,
-            non_trainable_variables=non_trainable_variables,
-            optimizer_variables=None,
-            metrics_variables=None,
-        )
         return outputs, non_trainable_variables
+
+    def _make_function(self, step_function, concatenate_outputs=False):
+        if self.steps_per_execution > 1:
+            if concatenate_outputs:
+
+                def concatenate(outputs):
+                    if not outputs:
+                        return []
+                    if len(outputs) == 1:
+                        return outputs[0]
+                    return tree.map_structure(
+                        lambda *args: jax.numpy.concatenate(args, axis=0),
+                        *outputs,
+                    )
+
+                if not self.run_eagerly and self.jit_compile:
+                    concatenate = jit(concatenate)
+
+                def iterator_step(state, iterator):
+                    data = next(iterator)
+                    outputs, state = step_function(state, data)
+                    outputs = [outputs]
+                    try:
+                        for _ in range(self.steps_per_execution - 1):
+                            data = next(iterator)
+                            _outputs, state = step_function(state, data)
+                            outputs.append(_outputs)
+                    except StopIteration:
+                        pass
+                    outputs = concatenate(outputs)
+                    return outputs, state
+
+            else:
+
+                def iterator_step(state, iterator):
+                    data = next(iterator)
+                    outputs, state = step_function(state, data)
+                    try:
+                        for _ in range(self.steps_per_execution - 1):
+                            data = next(iterator)
+                            outputs, state = step_function(state, data)
+                    except StopIteration:
+                        pass
+                    return outputs, state
+
+        else:
+
+            def iterator_step(state, iterator):
+                return step_function(state, next(iterator))
+
+        return iterator_step
 
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
             return
-
-        def one_train_step(state, data):
-            data = data[0]
-            return self.train_step(state, data)
-
-        def multi_train_steps(state, data):
-            for single_step_data in data:
-                logs, state = one_train_step(state, [single_step_data])
-            return logs, state
-
-        if self.steps_per_execution > 1:
-            train_step = multi_train_steps
-        else:
-            train_step = one_train_step
-
         if not self.run_eagerly and self.jit_compile:
-            # Note that we mark the state and data to be donated to jax,
-            # so that jax will reuse the memory buffer for outputs.
-            # This will reduce the memory usage of the training function by
-            # half.
-            @partial(jax.jit, donate_argnames="state")
-            def compiled_train_step(state, data):
-                return train_step(state, data)
-
-            self.train_function = compiled_train_step
-
+            out_shardings = None
+            if distribution_lib.distribution() is not None:
+                state_shardings = self._get_state_sharding_spec()
+                out_shardings = (None, state_shardings)
+            if is_nnx_enabled():
+                step_fn = lambda state, data: type(self).train_step(
+                    self, state, data
+                )
+            else:
+                step_fn = self.train_step
+            train_step = jit(
+                step_fn,
+                donate_argnums=0,
+                out_shardings=out_shardings,
+            )
         else:
-            self.train_function = train_step
+            train_step = self.train_step
+
+        step_function = self._make_function(train_step)
+
+        self.train_function = step_function
 
     def make_test_function(self, force=False):
         if self.test_function is not None and not force:
             return
-
-        def one_test_step(state, data):
-            data = data[0]
-            return self.test_step(state, data)
-
-        def multi_test_steps(state, data):
-            for single_step_data in data:
-                logs, state = one_test_step(state, [single_step_data])
-            return logs, state
-
-        if self.steps_per_execution > 1:
-            test_step = multi_test_steps
-        else:
-            test_step = one_test_step
-
         if not self.run_eagerly and self.jit_compile:
-            # Note that we mark the state and data to be donated to jax,
-            # so that jax will reuse the memory buffer for outputs.
-            # This will reduce the memory usage of the training function by
-            # half.
-            @partial(jax.jit, donate_argnames="state")
-            def compiled_test_step(state, data):
-                return test_step(state, data)
-
-            self.test_function = compiled_test_step
-
+            out_shardings = None
+            if distribution_lib.distribution() is not None:
+                (
+                    trainable_shardings,
+                    non_trainable_shardings,
+                    _,  # optimizer_shardings
+                    metrics_shardings,
+                ) = self._get_state_sharding_spec()
+                state_shardings = (
+                    trainable_shardings,
+                    non_trainable_shardings,
+                    metrics_shardings,
+                )
+                out_shardings = (None, state_shardings)
+            if is_nnx_enabled():
+                step_fn = lambda state, data: type(self).test_step(
+                    self, state, data
+                )
+            else:
+                step_fn = self.test_step
+            test_step = jit(
+                step_fn,
+                donate_argnums=0,
+                out_shardings=out_shardings,
+            )
         else:
-            self.test_function = test_step
+            test_step = self.test_step
+
+        step_function = self._make_function(test_step)
+
+        self.test_function = step_function
 
     def make_predict_function(self, force=False):
         if self.predict_function is not None and not force:
             return self.predict_function
 
-        def one_predict_step(state, data):
-            data = data[0]
-            return self.predict_step(state, data)
-
-        def multi_predict_steps(state, data):
-            outputs, trainable_variables = one_predict_step(state, data[:1])
-
-            for single_step_data in data[1:]:
-                step_outputs, trainable_variables = one_predict_step(
-                    state,
-                    [single_step_data],
-                )
-                outputs = tree.map_structure(
-                    lambda t1, t2: jax.numpy.concatenate([t1, t2]),
-                    outputs,
-                    step_outputs,
-                )
-            return outputs, trainable_variables
-
-        if self.steps_per_execution > 1:
-            predict_step = multi_predict_steps
-        else:
-            predict_step = one_predict_step
+        def predict_step(state, data):
+            outputs, non_trainable_variables = self.predict_step(state, data)
+            return outputs, (state[0], non_trainable_variables)
 
         if not self.run_eagerly and self.jit_compile:
+            out_shardings = None
+            if distribution_lib.distribution() is not None:
+                (
+                    trainable_shardings,
+                    non_trainable_shardings,
+                    _,  # optimizer_shardings
+                    _,  # metrics_shardings
+                ) = self._get_state_sharding_spec()
+                state_shardings = (
+                    trainable_shardings,
+                    non_trainable_shardings,
+                )
+                out_shardings = (None, state_shardings)
+            predict_step = jit(
+                predict_step,
+                donate_argnums=0,
+                out_shardings=out_shardings,
+            )
 
-            @jax.jit
-            def compiled_predict_step(state, data):
-                return predict_step(state, data)
+        _step_function = self._make_function(
+            predict_step, concatenate_outputs=True
+        )
 
-            self.predict_function = compiled_predict_step
+        def step_function(state, iterator):
+            outputs, state = _step_function(state, iterator)
+            return outputs, state
 
-        else:
-            self.predict_function = predict_step
+        self.predict_function = step_function
 
     @traceback_utils.filter_traceback
     def fit(
@@ -347,16 +379,20 @@ class JAXTrainer(base_trainer.Trainer):
         validation_freq=1,
     ):
         self._assert_compile_called("fit")
+        # Possibly cap epochs for debugging runs.
+        max_epochs = config.max_epochs()
+        if max_epochs and max_epochs < epochs:
+            warnings.warn("Limiting epochs to %d" % max_epochs)
+            epochs = max_epochs
         # TODO: respect compiled trainable state
         self._eval_epoch_iterator = None
         if validation_split and validation_data is None:
             # Create the validation data using the training data. Only supported
             # for TF/numpy/jax arrays.
             (
-                x,
-                y,
-                sample_weight,
-            ), validation_data = array_slicing.train_validation_split(
+                (x, y, sample_weight),
+                validation_data,
+            ) = array_slicing.train_validation_split(
                 (x, y, sample_weight), validation_split=validation_split
             )
 
@@ -380,6 +416,7 @@ class JAXTrainer(base_trainer.Trainer):
         )
 
         self._symbolic_build(iterator=epoch_iterator)
+        epoch_iterator.reset()
 
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
@@ -392,114 +429,121 @@ class JAXTrainer(base_trainer.Trainer):
                 steps=epoch_iterator.num_batches,
                 model=self,
             )
-        self._record_training_state_sharding_spec()
 
         self.make_train_function()
         self.stop_training = False
+        training_logs = {}
+        training_finished = False
         callbacks.on_train_begin()
         initial_epoch = self._initial_epoch or initial_epoch
-        for epoch in range(initial_epoch, epochs):
-            self.reset_metrics()
-            callbacks.on_epoch_begin(epoch)
+        try:
+            for epoch in range(initial_epoch, epochs):
+                self.reset_metrics()
+                callbacks.on_epoch_begin(epoch)
 
-            self._jax_state_synced = True
-            for step, data in epoch_iterator.enumerate_epoch():
-                # Callbacks
-                callbacks.on_train_batch_begin(step)
+                self._jax_state_synced = True
+                with epoch_iterator.catch_stop_iteration():
+                    for begin_step, end_step, iterator in epoch_iterator:
+                        # Callbacks
+                        callbacks.on_train_batch_begin(begin_step)
 
-                # Train step
-                if self._jax_state_synced:
-                    # The state may have been synced by a callback.
-                    state = self._get_jax_state(
-                        trainable_variables=True,
-                        non_trainable_variables=True,
-                        optimizer_variables=True,
-                        metrics_variables=True,
-                        purge_model_variables=True,
-                    )
-                    self._jax_state_synced = False
+                        # Train step
+                        if self._jax_state_synced:
+                            # The state may have been synced by a callback.
+                            state = self._get_jax_state(
+                                trainable_variables=True,
+                                non_trainable_variables=True,
+                                optimizer_variables=True,
+                                metrics_variables=True,
+                                purge_model_variables=True,
+                            )
+                            self._jax_state_synced = False
 
-                logs, state = self.train_function(state, data)
-                (
-                    trainable_variables,
-                    non_trainable_variables,
-                    optimizer_variables,
-                    metrics_variables,
-                ) = state
+                        logs, state = self.train_function(state, iterator)
+                        (
+                            trainable_variables,
+                            non_trainable_variables,
+                            optimizer_variables,
+                            metrics_variables,
+                        ) = state
 
-                # Setting _jax_state enables callbacks to force a state sync
-                # if they need to.
-                self._jax_state = {
-                    "trainable_variables": trainable_variables,
-                    "non_trainable_variables": non_trainable_variables,
-                    "optimizer_variables": optimizer_variables,
-                    "metrics_variables": metrics_variables,
-                }
+                        # Setting _jax_state enables callbacks to force a state
+                        # sync if they need to.
+                        self._jax_state = {
+                            "trainable_variables": trainable_variables,
+                            "non_trainable_variables": non_trainable_variables,
+                            "optimizer_variables": optimizer_variables,
+                            "metrics_variables": metrics_variables,
+                        }
+                        # Dispatch callbacks. This takes care of async dispatch.
+                        callbacks.on_train_batch_end(end_step, logs)
 
-                # Callbacks
-                logs = self._pythonify_logs(logs)
-                callbacks.on_train_batch_end(step, logs)
-                if self.stop_training:
-                    break
+                        if self.stop_training:
+                            # Stop training if a callback has set
+                            # this flag in on_(train_)batch_end.
+                            break
 
-            # Reattach state to the model (if not already done by a callback).
-            # NOTE: doing this after each step would be a big performance
-            # bottleneck.
-            self.jax_state_sync()
+                # Reattach state to the model
+                # (if not already done by a callback).
+                # NOTE: doing this after each step would be a big performance
+                # bottleneck.
+                self.jax_state_sync()
 
-            # Override with model metrics instead of last step logs if needed.
-            # The jax spmd_mode is need for multi-process context, since the
-            # metrics values are replicated, and we don't want to do a all
-            # gather, and only need the local copy of the value.
-            with jax.spmd_mode("allow_all"):
+                # Override with model metrics instead of last step logs if
+                # needed.
                 epoch_logs = dict(self._get_metrics_result_or_logs(logs))
 
-            # Run validation.
-            if validation_data is not None and self._should_eval(
-                epoch, validation_freq
-            ):
-                # Create JAXEpochIterator for evaluation and cache it.
-                if getattr(self, "_eval_epoch_iterator", None) is None:
-                    self._eval_epoch_iterator = JAXEpochIterator(
+                # Run validation.
+                if validation_data is not None and self._should_eval(
+                    epoch, validation_freq
+                ):
+                    # Create JAXEpochIterator for evaluation and cache it.
+                    if getattr(self, "_eval_epoch_iterator", None) is None:
+                        self._eval_epoch_iterator = JAXEpochIterator(
+                            x=val_x,
+                            y=val_y,
+                            sample_weight=val_sample_weight,
+                            batch_size=validation_batch_size or batch_size,
+                            steps_per_execution=self.steps_per_execution,
+                            steps_per_epoch=validation_steps,
+                            shuffle=False,
+                        )
+                    val_logs = self.evaluate(
                         x=val_x,
                         y=val_y,
                         sample_weight=val_sample_weight,
                         batch_size=validation_batch_size or batch_size,
-                        steps_per_execution=self.steps_per_execution,
-                        steps_per_epoch=validation_steps,
-                        shuffle=False,
+                        steps=validation_steps,
+                        callbacks=callbacks,
+                        return_dict=True,
+                        _use_cached_eval_dataset=True,
                     )
-                val_logs = self.evaluate(
-                    x=val_x,
-                    y=val_y,
-                    sample_weight=val_sample_weight,
-                    batch_size=validation_batch_size or batch_size,
-                    steps=validation_steps,
-                    callbacks=callbacks,
-                    return_dict=True,
-                    _use_cached_eval_dataset=True,
-                )
-                val_logs = {
-                    "val_" + name: val for name, val in val_logs.items()
-                }
-                epoch_logs.update(val_logs)
+                    val_logs = {
+                        f"val_{name}": val for name, val in val_logs.items()
+                    }
+                    epoch_logs.update(val_logs)
 
-            callbacks.on_epoch_end(epoch, epoch_logs)
-            training_logs = epoch_logs
-            if self.stop_training:
-                break
+                callbacks.on_epoch_end(epoch, epoch_logs)
+                training_logs = epoch_logs
+                if self.stop_training:
+                    break
+            training_finished = True
 
-        if (
-            isinstance(self.optimizer, optimizers_module.Optimizer)
-            and epochs > 0
-        ):
-            self.optimizer.finalize_variable_values(self.trainable_weights)
+        finally:
+            self.jax_state_sync()
+            if (
+                isinstance(self.optimizer, optimizers_module.Optimizer)
+                and epochs > 0
+            ):
+                self.optimizer.finalize_variable_values(self.trainable_weights)
 
-        # If _eval_epoch_iterator exists, delete it after all epochs are done.
-        if getattr(self, "_eval_epoch_iterator", None) is not None:
-            del self._eval_epoch_iterator
-        callbacks.on_train_end(logs=training_logs)
-        self._jax_state = None
+            # If _eval_epoch_iterator exists, delete it after all epochs
+            # are done.
+            if getattr(self, "_eval_epoch_iterator", None) is not None:
+                del self._eval_epoch_iterator
+            if training_finished:
+                callbacks.on_train_end(logs=training_logs)
+            self._jax_state = None
         return self.history
 
     @traceback_utils.filter_traceback
@@ -524,7 +568,8 @@ class JAXTrainer(base_trainer.Trainer):
         if use_cached_eval_dataset:
             epoch_iterator = self._eval_epoch_iterator
         else:
-            # Create an iterator that yields batches of input/target data.
+            # Create an iterator that yields batches of
+            # input/target data.
             epoch_iterator = JAXEpochIterator(
                 x=x,
                 y=y,
@@ -536,71 +581,70 @@ class JAXTrainer(base_trainer.Trainer):
             )
 
         self._symbolic_build(iterator=epoch_iterator)
+        epoch_iterator.reset()
 
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
                 callbacks,
-                add_history=True,
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=1,
                 steps=epoch_iterator.num_batches,
                 model=self,
             )
-        self._record_training_state_sharding_spec()
 
         self.make_test_function()
         self.stop_evaluating = False
         callbacks.on_test_begin()
-        logs = None
+        logs = {}
         self.reset_metrics()
 
         self._jax_state_synced = True
-        for step, data in epoch_iterator.enumerate_epoch():
-            callbacks.on_test_batch_begin(step)
+        with epoch_iterator.catch_stop_iteration():
+            for begin_step, end_step, iterator in epoch_iterator:
+                callbacks.on_test_batch_begin(begin_step)
 
-            if self._jax_state_synced:
-                # The state may have been synced by a callback.
-                state = self._get_jax_state(
-                    trainable_variables=True,
-                    non_trainable_variables=True,
-                    metrics_variables=True,
-                    purge_model_variables=True,
-                )
-                self._jax_state_synced = False
+                if self._jax_state_synced:
+                    # The state may have been synced by a callback.
+                    state = self._get_jax_state(
+                        trainable_variables=True,
+                        non_trainable_variables=True,
+                        metrics_variables=True,
+                        purge_model_variables=True,
+                    )
+                    self._jax_state_synced = False
 
-            logs, state = self.test_function(state, data)
-            (
-                trainable_variables,
-                non_trainable_variables,
-                metrics_variables,
-            ) = state
+                logs, state = self.test_function(state, iterator)
+                (
+                    trainable_variables,
+                    non_trainable_variables,
+                    metrics_variables,
+                ) = state
 
-            # Setting _jax_state enables callbacks to force a state sync
-            # if they need to.
-            self._jax_state = {
-                # I wouldn't recommend modifying non-trainable model state
-                # during evaluate(), but it's allowed.
-                "trainable_variables": trainable_variables,
-                "non_trainable_variables": non_trainable_variables,
-                "metrics_variables": metrics_variables,
-            }
-            logs = self._pythonify_logs(logs)
-            callbacks.on_test_batch_end(step, logs)
-            if self.stop_evaluating:
-                break
+                # Setting _jax_state enables callbacks to force a state sync
+                # if they need to.
+                self._jax_state = {
+                    # I wouldn't recommend modifying non-trainable model state
+                    # during evaluate(), but it's allowed.
+                    "trainable_variables": trainable_variables,
+                    "non_trainable_variables": non_trainable_variables,
+                    "metrics_variables": metrics_variables,
+                }
+
+                # Dispatch callbacks. This takes care of async dispatch.
+                callbacks.on_test_batch_end(end_step, logs)
+
+                if self.stop_evaluating:
+                    break
 
         # Reattach state back to model (if not already done by a callback).
         self.jax_state_sync()
 
-        # The jax spmd_mode is need for multi-process context, since the
-        # metrics values are replicated, and we don't want to do a all
-        # gather, and only need the local copy of the value.
-        with jax.spmd_mode("allow_all"):
-            logs = self._get_metrics_result_or_logs(logs)
+        logs = pythonify_logs(self._get_metrics_result_or_logs(logs))
         callbacks.on_test_end(logs)
         self._jax_state = None
+
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
@@ -620,25 +664,28 @@ class JAXTrainer(base_trainer.Trainer):
 
         if not all(layer.built for layer in self._flatten_layers()):
             # Build the model on one batch of data.
-            for _, data in epoch_iterator.enumerate_epoch():
+            for _, _, iterator in epoch_iterator:
                 # Build model
-                x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(data[0])
-                with backend.StatelessScope():
+                x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(
+                    next(iterator)
+                )
+                if is_nnx_enabled():
                     self(x)
+                else:
+                    with backend.StatelessScope():
+                        self(x)
                 break
-
+            epoch_iterator.reset()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
                 callbacks,
-                add_history=True,
                 add_progbar=verbose != 0,
                 verbose=verbose,
                 epochs=1,
                 steps=epoch_iterator.num_batches,
                 model=self,
             )
-        self._record_training_state_sharding_spec()
 
         self.make_predict_function()
         self.stop_predicting = False
@@ -662,31 +709,38 @@ class JAXTrainer(base_trainer.Trainer):
         self._jax_state_synced = True
         outputs = None
         non_trainable_variables = None
-        for step, x in epoch_iterator.enumerate_epoch():
-            callbacks.on_predict_batch_begin(step)
-            if self._jax_state_synced:
-                # The state may have been synced by a callback.
-                state = self._get_jax_state(
-                    trainable_variables=True,
-                    non_trainable_variables=True,
-                )
-                self._purge_model_variables(non_trainable_variables=True)
-                self._jax_state_synced = False
-            else:
-                state = (state[0], non_trainable_variables)
-            batch_outputs, non_trainable_variables = self.predict_function(
-                state, x
-            )
-            outputs = append_to_outputs(batch_outputs, outputs)
-            callbacks.on_predict_batch_end(step, {"outputs": batch_outputs})
-            if self.stop_predicting:
-                break
+        with epoch_iterator.catch_stop_iteration():
+            for begin_step, end_step, iterator in epoch_iterator:
+                callbacks.on_predict_batch_begin(begin_step)
+                if self._jax_state_synced:
+                    # The state may have been synced by a callback.
+                    state = self._get_jax_state(
+                        trainable_variables=True,
+                        non_trainable_variables=True,
+                        purge_model_variables=True,
+                    )
+                    self._jax_state_synced = False
+                batch_outputs, state = self.predict_function(state, iterator)
+                (
+                    trainable_variables,
+                    non_trainable_variables,
+                ) = state
+                self._jax_state = {
+                    "trainable_variables": trainable_variables,
+                    # I wouldn't recommend modifying non-trainable model state
+                    # during predict(), but it's allowed.
+                    "non_trainable_variables": non_trainable_variables,
+                }
+                outputs = append_to_outputs(batch_outputs, outputs)
 
-        self._jax_state = {
-            # I wouldn't recommend modifying non-trainable model state
-            # during predict(), but it's allowed.
-            "non_trainable_variables": non_trainable_variables,
-        }
+                # Dispatch callbacks. This takes care of async dispatch.
+                callbacks.on_predict_batch_end(
+                    end_step, {"outputs": batch_outputs}
+                )
+
+                if self.stop_predicting:
+                    break
+
         self.jax_state_sync()
         callbacks.on_predict_end()
         self._jax_state = None
@@ -712,13 +766,14 @@ class JAXTrainer(base_trainer.Trainer):
             sample_weight = data_adapter_utils.class_weight_to_sample_weights(
                 y, class_weight
             )
-        data = (x, y, sample_weight)
-        data = _distribute_data(data)
+
+        def data():
+            yield _distribute_data((x, y, sample_weight))
 
         # Maybe build model
-        self._symbolic_build(data_batch=data)
-        self._record_training_state_sharding_spec()
+        self._symbolic_build(data_batch=next(data()))
         self.make_train_function()
+        self.reset_metrics()
 
         # Train step
         state = self._get_jax_state(
@@ -729,7 +784,7 @@ class JAXTrainer(base_trainer.Trainer):
             purge_model_variables=False,
         )
         self._jax_state_synced = False
-        logs, state = self.train_function(state, [data])
+        logs, state = self.train_function(state, data())
 
         # State sync
         (
@@ -747,7 +802,7 @@ class JAXTrainer(base_trainer.Trainer):
         self.jax_state_sync()
 
         # Format return values
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = pythonify_logs(logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
@@ -761,12 +816,13 @@ class JAXTrainer(base_trainer.Trainer):
     ):
         self._assert_compile_called("test_on_batch")
 
-        data = (x, y, sample_weight)
-        data = _distribute_data(data)
+        def data():
+            yield _distribute_data((x, y, sample_weight))
+
         # Maybe build model
-        self._symbolic_build(data_batch=data)
-        self._record_training_state_sharding_spec()
+        self._symbolic_build(data_batch=next(data()))
         self.make_test_function()
+        self.reset_metrics()
 
         # Test step
         state = self._get_jax_state(
@@ -776,7 +832,7 @@ class JAXTrainer(base_trainer.Trainer):
             purge_model_variables=False,
         )
         self._jax_state_synced = False
-        logs, state = self.test_function(state, [data])
+        logs, state = self.test_function(state, data())
 
         # State sync
         trainable_variables, non_trainable_variables, metrics_variables = state
@@ -788,7 +844,7 @@ class JAXTrainer(base_trainer.Trainer):
         self.jax_state_sync()
 
         # Format return values.
-        logs = tree.map_structure(lambda x: np.array(x), logs)
+        logs = pythonify_logs(logs)
         if return_dict:
             return logs
         return self._flatten_metrics_in_order(logs)
@@ -798,7 +854,6 @@ class JAXTrainer(base_trainer.Trainer):
             # Build model
             with backend.StatelessScope():
                 self(x)
-        self._record_training_state_sharding_spec()
         self.make_predict_function()
 
         state = self._get_jax_state(
@@ -808,10 +863,14 @@ class JAXTrainer(base_trainer.Trainer):
             purge_model_variables=False,
         )
         self._jax_state_synced = False
-        batch_outputs, non_trainable_variables = self.predict_function(
-            state, [(x,)]
-        )
+
+        def data():
+            yield (x,)
+
+        batch_outputs, state = self.predict_function(state, data())
+        trainable_variables, non_trainable_variables = state
         self._jax_state = {
+            "trainable_variables": trainable_variables,
             "non_trainable_variables": non_trainable_variables,
         }
         self.jax_state_sync()
@@ -844,69 +903,107 @@ class JAXTrainer(base_trainer.Trainer):
                 ref_v.assign(v)
         self._jax_state_synced = True
 
-    def _record_training_state_sharding_spec(self):
-        self._trainable_variable_shardings = [
+    def _get_state_sharding_spec(self):
+        trainable_shardings = [
             v.value.sharding for v in self.trainable_variables
         ]
-        self._non_trainable_variable_shardings = [
+        non_trainable_shardings = [
             v.value.sharding for v in self.non_trainable_variables
         ]
         if hasattr(self, "optimizer") and self.optimizer is not None:
-            self._optimizer_variable_shardings = [
+            optimizer_shardings = [
                 v.value.sharding for v in self.optimizer.variables
             ]
         else:
-            self._optimizer_variable_shardings = []
-        self._metrics_variable_shardings = [
-            v.value.sharding for v in self.metrics_variables
-        ]
+            optimizer_shardings = []
+        metrics_shardings = [v.value.sharding for v in self.metrics_variables]
 
-    def _enforce_jax_state_sharding(
-        self,
-        trainable_variables=None,
-        non_trainable_variables=None,
-        optimizer_variables=None,
-        metrics_variables=None,
-    ):
-        """Enforce the sharding spec constraint for all the training state.
+        self._check_sharding_consistency(
+            trainable_shardings,
+            non_trainable_shardings,
+            optimizer_shardings,
+            metrics_shardings,
+        )
 
-        Since the output of the train/eval step will be used as inputs to next
-        step, we need to ensure that they have the same sharding spec, so that
-        jax.jit won't have to recompile the train/eval function.
-
-        Note that this function will also rely on the recorded sharding spec
-        for each of states.
-
-        This function is expected to be called within the jitted train/eval
-        function, especially around the end of the function.
-        """
-        trainable_variables = trainable_variables or []
-        non_trainable_variables = non_trainable_variables or []
-        optimizer_variables = optimizer_variables or []
-        metrics_variables = metrics_variables or []
-
-        for i in range(len(trainable_variables)):
-            trainable_variables[i] = jax.lax.with_sharding_constraint(
-                trainable_variables[i], self._trainable_variable_shardings[i]
-            )
-        for i in range(len(non_trainable_variables)):
-            non_trainable_variables[i] = jax.lax.with_sharding_constraint(
-                non_trainable_variables[i],
-                self._non_trainable_variable_shardings[i],
-            )
-        for i in range(len(optimizer_variables)):
-            optimizer_variables[i] = jax.lax.with_sharding_constraint(
-                optimizer_variables[i], self._optimizer_variable_shardings[i]
-            )
-        for i in range(len(metrics_variables)):
-            metrics_variables[i] = jax.lax.with_sharding_constraint(
-                metrics_variables[i], self._metrics_variable_shardings[i]
-            )
         return (
-            trainable_variables,
-            non_trainable_variables,
-            optimizer_variables,
-            metrics_variables,
+            trainable_shardings,
+            non_trainable_shardings,
+            optimizer_shardings,
+            metrics_shardings,
+        )
+
+    def _check_sharding_consistency(
+        self,
+        trainable_shardings,
+        non_trainable_shardings,
+        optimizer_shardings,
+        metrics_shardings,
+    ):
+        """Warn if there is a mix of local and distributed variable shardings.
+
+        When some variables have SingleDeviceSharding (created outside the
+        distribution scope) and others have mesh-aware shardings (created
+        inside), passing them together as `out_shardings` to `jax.jit`
+        raises ``ValueError: Received incompatible devices for jitted
+        computation``. This helper detects the mismatch early and emits
+        an actionable warning.
+        """
+        if distribution_lib.distribution() is None:
+            return
+
+        var_shard_pairs = itertools.chain(
+            zip(self.trainable_variables, trainable_shardings),
+            zip(self.non_trainable_variables, non_trainable_shardings),
+            zip(
+                (
+                    self.optimizer.variables
+                    if hasattr(self, "optimizer") and self.optimizer
+                    else []
+                ),
+                optimizer_shardings,
+            ),
+            zip(self.metrics_variables, metrics_shardings),
+        )
+
+        first_local_var_path = None
+        has_mesh = False
+        for v, s in var_shard_pairs:
+            if isinstance(s, jax.sharding.SingleDeviceSharding):
+                if first_local_var_path is None:
+                    first_local_var_path = v.path
+            else:
+                has_mesh = True
+            # Early exit: we know there is a mix as soon as we have
+            # seen at least one of each kind.
+            if first_local_var_path and has_mesh:
+                break
+
+        if not (first_local_var_path and has_mesh):
+            return
+
+        warnings.warn(
+            "Detected a mix of local (SingleDeviceSharding) and "
+            "distributed (mesh-aware) variables. This will cause "
+            "a 'ValueError: Received incompatible devices for "
+            "jitted computation' when JAX tries to compile the "
+            "training step.\n\n"
+            f"First local variable found: {first_local_var_path!r}\n\n"
+            "This typically happens when the model is built or "
+            "weights are loaded before the distribution is set. "
+            "To fix this, call set_distribution() before creating "
+            "any Keras objects:\n\n"
+            "    import keras\n"
+            "    keras.distribution.set_distribution(distribution)\n"
+            "    model = create_model()\n"
+            "    model.compile(...)\n"
+            "    model.fit(...)\n\n"
+            "Alternatively, use the distribution scope context "
+            "manager:\n\n"
+            "    with distribution.scope():\n"
+            "        model = create_model()\n"
+            "        model.compile(...)\n"
+            "        model.fit(...)\n",
+            stacklevel=3,
         )
 
     def _purge_model_variables(
@@ -918,9 +1015,9 @@ class JAXTrainer(base_trainer.Trainer):
     ):
         """Remove all the model variable for memory saving.
 
-        During JAX training, since the training function are stateless, we have
+        During JAX training, since the training function is stateless, we have
         to pass in and get the model weights over and over, during which the
-        copy of the weights that attached to the KerasVariable are still and
+        copy of the weights that attached to the Variable are still and
         occupying extra memory. We remove those variable to save memory (for
         better memory utilization) at the beginning of the epoch, and reattach
         the value back to variables at the end of the epoch, via
@@ -966,46 +1063,73 @@ class JAXTrainer(base_trainer.Trainer):
         return tuple(state)
 
 
-def _distribute_data(data):
+def _distribute_data(data, layouts=None):
     distribution = distribution_lib.distribution()
+
     if distribution is not None:
+        if layouts is None:
 
-        def distribute_single_value(d):
-            layout = distribution.get_data_layout(d.shape)
-            return jax_distribution_lib.distribute_data_input(d, layout)
+            def get_layout(d):
+                if d is None:
+                    return None
+                return distribution.get_data_layout(d.shape)
 
-        return tree.map_structure(distribute_single_value, data)
-    else:
-        return tree.map_structure(jax.device_put, data)
+            layouts = tree.map_structure(get_layout, data)
+        jax_dist_data_input = partial(
+            jax_distribution_lib.distribute_data_input,
+            batch_dim_name=distribution.batch_dim_name,
+        )
+        return tree.map_structure(jax_dist_data_input, data, layouts)
+
+    return tree.map_structure(jax.device_put, data)
 
 
 class JAXEpochIterator(EpochIterator):
+    def __next__(self):
+        return next(self._epoch_iterator)
+
     def _get_iterator(self):
-        return self._prefetch_numpy_iterator(
-            self.data_adapter.get_jax_iterator()
-        )
+        distribution = distribution_lib.distribution()
+        if distribution is not None:
+            return self._get_distributed_iterator(distribution)
+        else:
+            iterator = self.data_adapter.get_jax_iterator()
+            # No benefit from look-ahead on CPU — avoid the overhead
+            if jax.default_backend() == "cpu":
+                return iterator
+            return self._one_batch_ahead_iterator(iterator)
 
-    def _prefetch_numpy_iterator(self, numpy_iterator):
-        """Shard and prefetch batches on device.
+    def _get_distributed_iterator(self, distribution):
+        """Lazily compute layouts to reduce host to device transfer latency."""
+        layouts = None
+        for data in self.data_adapter.get_jax_iterator():
+            if layouts is None:
 
-        Most of the implementation has been borrowed from
-        `flax.jax_utils.prefetch_to_device`
+                def get_layout(d):
+                    if d is None:
+                        return None
+                    return distribution.get_data_layout(d.shape).backend_layout
 
-        This utility takes an iterator and returns a new iterator which fills an
-        on device prefetch buffer. Eager prefetching can improve the performance
-        of training loops significantly by overlapping compute and data
-        transfer.
+                layouts = tree.map_structure(get_layout, data)
+            yield _distribute_data(data, layouts)
+
+    def _one_batch_ahead_iterator(self, numpy_iterator):
+        """Initiate transfers to the device one batch ahead.
+
+        This utility takes an iterator and returns a new iterator which
+        initiates the transfer to device one step ahead. This can improve the
+        performance of training loops significantly by overlapping compute and
+        data transfer.
         """
-        queue = collections.deque()
+        next_batch = None
+        for batch in numpy_iterator:
+            batch = _distribute_data(batch)
+            if next_batch is None:
+                next_batch = batch
+            else:
+                current_batch = next_batch
+                next_batch = batch
+                yield current_batch
 
-        # If you're training on GPUs, 2 is generally the best choice because
-        # this guarantees that you can overlap a training step on GPU with a
-        # data prefetch step on CPU.
-        def enqueue(n=2):
-            for data in itertools.islice(numpy_iterator, n):
-                queue.append(_distribute_data(data))
-
-        enqueue(n=2)  # TODO: should we make `n` configurable?
-        while queue:
-            yield queue.popleft()
-            enqueue(1)
+        if next_batch is not None:
+            yield next_batch

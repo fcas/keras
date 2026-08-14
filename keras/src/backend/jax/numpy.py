@@ -1,8 +1,10 @@
 import builtins
 import math
 
+import jax
 import jax.experimental.sparse as jax_sparse
 import jax.numpy as jnp
+from jax import export as jax_export
 
 from keras.src.backend import config
 from keras.src.backend.common import dtypes
@@ -15,6 +17,33 @@ from keras.src.backend.jax.core import cast
 from keras.src.backend.jax.core import convert_to_tensor
 
 
+def _uses_cpu(x):
+    if hasattr(x, "device"):
+        device = x.device
+        if not isinstance(device, jax.Device):
+            # Array is sharded.
+            return False
+        return device.platform == "cpu"
+    else:
+        # This is a Tracer, not a concrete Array.
+        return jax.default_backend() == "cpu"
+
+
+def rot90(array, k=1, axes=(0, 1)):
+    """Rotate an array by 90 degrees in the specified plane."""
+    if array.ndim < 2:
+        raise ValueError(
+            f"Input array must have at least 2 dimensions. "
+            f"Received: array.ndim={array.ndim}"
+        )
+    if len(axes) != 2 or axes[0] == axes[1]:
+        raise ValueError(
+            f"Invalid axes: {axes}. Axes must be a tuple of "
+            "two different dimensions."
+        )
+    return jnp.rot90(array, k=k, axes=axes)
+
+
 @sparse.elementwise_binary_union(linear=True, use_sparsify=True)
 def add(x1, x2):
     x1 = convert_to_tensor(x1)
@@ -22,8 +51,40 @@ def add(x1, x2):
     return jnp.add(x1, x2)
 
 
+def bartlett(x):
+    x = convert_to_tensor(x)
+    return cast(jnp.bartlett(x), config.floatx())
+
+
+def hamming(x):
+    x = convert_to_tensor(x)
+    return cast(jnp.hamming(x), config.floatx())
+
+
+def hanning(x):
+    x = convert_to_tensor(x)
+    return cast(jnp.hanning(x), config.floatx())
+
+
+def heaviside(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.heaviside(x1, x2)
+
+
+def hypot(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.hypot(x1, x2)
+
+
+def kaiser(x, beta):
+    x = convert_to_tensor(x)
+    return cast(jnp.kaiser(x, beta), config.floatx())
+
+
 def bincount(x, weights=None, minlength=0, sparse=False):
-    # Note: bincount is never tracable / jittable because the output shape
+    # Note: bincount is never traceable / jittable because the output shape
     # depends on the values in x.
     if sparse or isinstance(x, jax_sparse.BCOO):
         if isinstance(x, jax_sparse.BCOO):
@@ -227,8 +288,23 @@ def abs(x):
     return absolute(x)
 
 
+def fabs(x):
+    x = convert_to_tensor(x)
+    return jnp.fabs(x)
+
+
 def all(x, axis=None, keepdims=False):
     return jnp.all(x, axis=axis, keepdims=keepdims)
+
+
+def angle(x):
+    x = convert_to_tensor(x)
+    if standardize_dtype(x.dtype) == "int64":
+        dtype = config.floatx()
+    else:
+        dtype = dtypes.result_type(x.dtype, float)
+    x = cast(x, dtype)
+    return jnp.angle(x)
 
 
 def any(x, axis=None, keepdims=False):
@@ -249,14 +325,20 @@ def append(x1, x2, axis=None):
     return jnp.append(x1, x2, axis=axis)
 
 
-def arange(start, stop=None, step=1, dtype=None):
+def arange(start, stop=None, step=None, dtype=None):
+    def get_dtype(x):
+        if hasattr(x, "dtype"):
+            return x.dtype
+        if jax_export.is_symbolic_dim(x):
+            return int
+        return type(x)
+
     if dtype is None:
-        dtypes_to_resolve = [
-            getattr(start, "dtype", type(start)),
-            getattr(step, "dtype", type(step)),
-        ]
+        dtypes_to_resolve = [get_dtype(start)]
         if stop is not None:
-            dtypes_to_resolve.append(getattr(stop, "dtype", type(stop)))
+            dtypes_to_resolve.append(get_dtype(stop))
+        if step is not None:
+            dtypes_to_resolve.append(get_dtype(step))
         dtype = dtypes.result_type(*dtypes_to_resolve)
     dtype = standardize_dtype(dtype)
     return jnp.arange(start, stop, step=step, dtype=dtype)
@@ -338,10 +420,32 @@ def arctanh(x):
 
 
 def argmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    if "float" not in dtype or x.ndim == 0 or not _uses_cpu(x):
+        return jnp.argmax(x, axis=axis, keepdims=keepdims)
+
+    # Fix the flush-to-zero (FTZ) issue based on this issue:
+    # https://github.com/jax-ml/jax/issues/24280
+    dtype = dtypes.result_type(dtype, "float32")
+    x = cast(x, dtype)
+    is_negative_zero = (x == 0.0) & jnp.signbit(x)
+    x = jnp.where(is_negative_zero, -jnp.finfo(x.dtype).tiny, x)
     return jnp.argmax(x, axis=axis, keepdims=keepdims)
 
 
 def argmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    if "float" not in dtype or x.ndim == 0 or not _uses_cpu(x):
+        return jnp.argmin(x, axis=axis, keepdims=keepdims)
+
+    # Fix the flush-to-zero (FTZ) issue based on this issue:
+    # https://github.com/jax-ml/jax/issues/24280
+    dtype = dtypes.result_type(dtype, "float32")
+    x = cast(x, dtype)
+    is_negative_zero = (x == 0.0) & jnp.signbit(x)
+    x = jnp.where(is_negative_zero, -jnp.finfo(x.dtype).tiny, x)
     return jnp.argmin(x, axis=axis, keepdims=keepdims)
 
 
@@ -354,6 +458,11 @@ def argsort(x, axis=-1):
 
 def array(x, dtype=None):
     return jnp.array(x, dtype=dtype)
+
+
+def view(x, dtype=None):
+    x = convert_to_tensor(x)
+    return x.view(dtype=dtype)
 
 
 def average(x, axis=None, weights=None):
@@ -369,9 +478,68 @@ def average(x, axis=None, weights=None):
     return jnp.average(x, weights=weights, axis=axis)
 
 
+def bitwise_and(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    return jnp.bitwise_and(x, y)
+
+
+def bitwise_invert(x):
+    x = convert_to_tensor(x)
+    return jnp.invert(x)
+
+
+def bitwise_not(x):
+    return bitwise_invert(x)
+
+
+def bitwise_or(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    return jnp.bitwise_or(x, y)
+
+
+def bitwise_xor(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    return jnp.bitwise_xor(x, y)
+
+
+def bitwise_left_shift(x, y):
+    x = convert_to_tensor(x)
+    if not isinstance(y, int):
+        y = convert_to_tensor(y)
+    return jnp.left_shift(x, y)
+
+
+def left_shift(x, y):
+    return bitwise_left_shift(x, y)
+
+
+def bitwise_right_shift(x, y):
+    x = convert_to_tensor(x)
+    if not isinstance(y, int):
+        y = convert_to_tensor(y)
+    return jnp.right_shift(x, y)
+
+
+def right_shift(x, y):
+    return bitwise_right_shift(x, y)
+
+
+def blackman(x):
+    x = convert_to_tensor(x)
+    return cast(jnp.blackman(x), config.floatx())
+
+
 def broadcast_to(x, shape):
     x = convert_to_tensor(x)
     return jnp.broadcast_to(x, shape)
+
+
+def cbrt(x):
+    x = convert_to_tensor(x)
+    return jnp.cbrt(x)
 
 
 @sparse.elementwise_unary(linear=False)
@@ -381,7 +549,8 @@ def ceil(x):
         dtype = config.floatx()
     else:
         dtype = dtypes.result_type(x.dtype, float)
-    return cast(jnp.ceil(x), dtype)
+    x = cast(x, dtype)
+    return jnp.ceil(x)
 
 
 def clip(x, x_min, x_max):
@@ -393,15 +562,18 @@ def clip(x, x_min, x_max):
 
 def concatenate(xs, axis=0):
     bcoo_count = builtins.sum(isinstance(x, jax_sparse.BCOO) for x in xs)
-    if bcoo_count:
-        if bcoo_count == len(xs):
-            axis = canonicalize_axis(axis, len(xs[0].shape))
-            return jax_sparse.bcoo_concatenate(xs, dimension=axis)
-        else:
-            xs = [
-                x.todense() if isinstance(x, jax_sparse.JAXSparse) else x
-                for x in xs
-            ]
+    if bcoo_count == len(xs):
+        axis = canonicalize_axis(axis, len(xs[0].shape))
+        return jax_sparse.bcoo_concatenate(xs, dimension=axis)
+    elif bcoo_count:
+        xs = [
+            x.todense()
+            if isinstance(x, jax_sparse.JAXSparse)
+            else convert_to_tensor(x)
+            for x in xs
+        ]
+    else:
+        xs = [convert_to_tensor(x) for x in xs]
     return jnp.concatenate(xs, axis=axis)
 
 
@@ -472,9 +644,24 @@ def cumsum(x, axis=None, dtype=None):
     return jnp.cumsum(x, axis=axis, dtype=dtype)
 
 
+def deg2rad(x):
+    x = convert_to_tensor(x)
+    return jnp.deg2rad(x)
+
+
+def rad2deg(x):
+    x = convert_to_tensor(x)
+    return jnp.rad2deg(x)
+
+
 def diag(x, k=0):
     x = convert_to_tensor(x)
     return jnp.diag(x, k=k)
+
+
+def diagflat(x, k=0):
+    x = convert_to_tensor(x)
+    return jnp.diagflat(x, k=k)
 
 
 def diagonal(x, offset=0, axis1=0, axis2=1):
@@ -499,15 +686,23 @@ def digitize(x, bins):
     return jnp.digitize(x, bins)
 
 
-def dot(x, y):
-    x = convert_to_tensor(x)
-    y = convert_to_tensor(y)
-    return jnp.dot(x, y)
+def dot(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.dot(x1, x2)
+
+
+def dstack(xs):
+    return jnp.dstack(xs)
 
 
 def empty(shape, dtype=None):
     dtype = dtype or config.floatx()
     return jnp.empty(shape, dtype=dtype)
+
+
+def empty_like(x, dtype=None):
+    return jnp.empty_like(x, dtype=dtype)
 
 
 def equal(x1, x2):
@@ -523,6 +718,15 @@ def exp(x):
     if "int" in ori_dtype or ori_dtype == "bool":
         x = cast(x, config.floatx())
     return jnp.exp(x)
+
+
+@sparse.densifying_unary
+def exp2(x):
+    x = convert_to_tensor(x)
+    ori_dtype = standardize_dtype(x.dtype)
+    if "int" in ori_dtype or ori_dtype == "bool":
+        x = cast(x, config.floatx())
+    return jnp.exp2(x)
 
 
 def expand_dims(x, axis):
@@ -554,11 +758,24 @@ def flip(x, axis=None):
     return jnp.flip(x, axis=axis)
 
 
+def fliplr(x):
+    x = convert_to_tensor(x)
+    return jnp.fliplr(x)
+
+
+def flipud(x):
+    x = convert_to_tensor(x)
+    return jnp.flipud(x)
+
+
 @sparse.elementwise_unary(linear=False)
 def floor(x):
     x = convert_to_tensor(x)
     if standardize_dtype(x.dtype) == "int64":
-        x = cast(x, config.floatx())
+        dtype = config.floatx()
+    else:
+        dtype = dtypes.result_type(x.dtype, float)
+    x = cast(x, dtype)
     return jnp.floor(x)
 
 
@@ -569,6 +786,18 @@ def full(shape, fill_value, dtype=None):
 
 def full_like(x, fill_value, dtype=None):
     return jnp.full_like(x, fill_value, dtype=dtype)
+
+
+def gcd(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.gcd(x1, x2)
+
+
+def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
+    return jnp.geomspace(
+        start, stop, num=num, endpoint=endpoint, dtype=dtype, axis=axis
+    )
 
 
 def greater(x1, x2):
@@ -587,6 +816,11 @@ def hstack(xs):
     return jnp.hstack(xs)
 
 
+def hsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    return jnp.hsplit(x, indices_or_sections)
+
+
 def identity(n, dtype=None):
     dtype = dtype or config.floatx()
     return jnp.identity(n, dtype=dtype)
@@ -598,16 +832,39 @@ def imag(x):
     return jnp.imag(x)
 
 
-def isclose(x1, x2):
+def i0(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    if dtype in ["int64", "float64"]:
+        dtype = "float64"
+    elif dtype not in ["bfloat16", "float16"]:
+        dtype = config.floatx()
+    x = cast(x, dtype)
+    return jnp.i0(x)
+
+
+def isclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    return jnp.isclose(x1, x2)
+    return jnp.isclose(x1, x2, rtol, atol, equal_nan)
+
+
+def allclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.allclose(x1, x2, rtol, atol, equal_nan)
 
 
 @sparse.densifying_unary
 def isfinite(x):
     x = convert_to_tensor(x)
     return jnp.isfinite(x)
+
+
+def isin(x1, x2, assume_unique=False, invert=False):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.isin(x1, x2, assume_unique=assume_unique, invert=invert)
 
 
 @sparse.elementwise_unary(linear=False)
@@ -620,6 +877,46 @@ def isinf(x):
 def isnan(x):
     x = convert_to_tensor(x)
     return jnp.isnan(x)
+
+
+def isneginf(x):
+    x = convert_to_tensor(x)
+    return jnp.isneginf(x)
+
+
+def isposinf(x):
+    x = convert_to_tensor(x)
+    return jnp.isposinf(x)
+
+
+def isreal(x):
+    x = convert_to_tensor(x)
+    return jnp.isreal(x)
+
+
+def kron(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.kron(x1, x2)
+
+
+def lcm(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.lcm(x1, x2)
+
+
+def ldexp(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    if standardize_dtype(x2.dtype) not in dtypes.INT_TYPES:
+        raise TypeError(
+            f"ldexp exponent must be an integer type. "
+            f"Received: x2 dtype={x2.dtype}"
+        )
+
+    return jnp.ldexp(x1, x2)
 
 
 def less(x1, x2):
@@ -689,6 +986,15 @@ def logaddexp(x1, x2):
     return jnp.logaddexp(x1, x2)
 
 
+def logaddexp2(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+    x1 = cast(x1, dtype)
+    x2 = cast(x2, dtype)
+    return jnp.logaddexp2(x1, x2)
+
+
 def logical_and(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -725,6 +1031,12 @@ def maximum(x1, x2):
     return jnp.maximum(x1, x2)
 
 
+def fmax(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.fmax(x1, x2)
+
+
 def median(x, axis=None, keepdims=False):
     # axis of jnp.median must be hashable
     if isinstance(axis, list):
@@ -758,14 +1070,98 @@ def minimum(x1, x2):
     return jnp.minimum(x1, x2)
 
 
+def fmin(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.fmin(x1, x2)
+
+
 def mod(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
     return jnp.mod(x1, x2)
 
 
+def fmod(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.fmod(x1, x2)
+
+
 def moveaxis(x, source, destination):
     return jnp.moveaxis(x, source=source, destination=destination)
+
+
+def nanargmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanargmax(x, axis=axis, keepdims=keepdims)
+
+
+def nanargmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanargmin(x, axis=axis, keepdims=keepdims)
+
+
+def nancumsum(x, axis=None, dtype=None):
+    x = convert_to_tensor(x)
+    return jnp.nancumsum(x, axis=axis, dtype=dtype)
+
+
+def nancumprod(x, axis=None, dtype=None):
+    x = convert_to_tensor(x)
+    return jnp.nancumprod(x, axis=axis, dtype=dtype)
+
+
+def nanmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanmax(x, axis=axis, keepdims=keepdims)
+
+
+def nanmean(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanmean(x, axis=axis, keepdims=keepdims)
+
+
+def nanmedian(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanmedian(x, axis=axis, keepdims=keepdims)
+
+
+def nanmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanmin(x, axis=axis, keepdims=keepdims)
+
+
+def nanpercentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q)
+    return jnp.nanpercentile(x, q, axis=axis, method=method, keepdims=keepdims)
+
+
+def nanprod(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanprod(x, axis=axis, keepdims=keepdims)
+
+
+def nanquantile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q)
+    return jnp.nanquantile(x, q, axis=axis, method=method, keepdims=keepdims)
+
+
+def nanstd(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanstd(x, axis=axis, keepdims=keepdims)
+
+
+def nansum(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nansum(x, axis=axis, keepdims=keepdims)
+
+
+def nanvar(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanvar(x, axis=axis, keepdims=keepdims)
 
 
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
@@ -813,9 +1209,20 @@ def pad(x, pad_width, mode="constant", constant_values=None):
     return jnp.pad(x, pad_width, mode=mode, **kwargs)
 
 
+def percentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q)
+    return jnp.percentile(x, q, axis=axis, method=method, keepdims=keepdims)
+
+
 def prod(x, axis=None, keepdims=False, dtype=None):
     x = convert_to_tensor(x)
     return jnp.prod(x, axis=axis, keepdims=keepdims, dtype=dtype)
+
+
+def ptp(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.ptp(x, axis=axis, keepdims=keepdims)
 
 
 def quantile(x, q, axis=None, method="linear", keepdims=False):
@@ -837,6 +1244,11 @@ def quantile(x, q, axis=None, method="linear", keepdims=False):
 def ravel(x):
     x = convert_to_tensor(x)
     return jnp.ravel(x)
+
+
+def unravel_index(indices, shape):
+    indices = convert_to_tensor(indices)
+    return jnp.unravel_index(indices, shape)
 
 
 @sparse.elementwise_unary(linear=True)
@@ -867,6 +1279,7 @@ def reshape(x, newshape):
         if None not in output_shape:
             newshape = output_shape
         return jax_sparse.bcoo_reshape(x, new_sizes=newshape)
+    x = convert_to_tensor(x)
     return jnp.reshape(x, newshape)
 
 
@@ -874,10 +1287,27 @@ def roll(x, shift, axis=None):
     return jnp.roll(x, shift, axis=axis)
 
 
+def searchsorted(sorted_sequence, values, side="left"):
+    if ndim(sorted_sequence) != 1:
+        raise ValueError(
+            "`searchsorted` only supports 1-D sorted sequences. "
+            "You can use `keras.ops.vectorized_map` "
+            "to extend it to N-D sequences. Received: "
+            f"sorted_sequence.shape={sorted_sequence.shape}"
+        )
+    return jnp.searchsorted(sorted_sequence, values, side=side)
+
+
 @sparse.elementwise_unary(linear=False)
 def sign(x):
     x = convert_to_tensor(x)
     return jnp.sign(x)
+
+
+@sparse.elementwise_unary(linear=False)
+def signbit(x):
+    x = convert_to_tensor(x)
+    return jnp.signbit(x)
 
 
 @sparse.elementwise_unary(linear=False)
@@ -889,6 +1319,16 @@ def sin(x):
         dtype = dtypes.result_type(x.dtype, float)
     x = cast(x, dtype)
     return jnp.sin(x)
+
+
+def sinc(x):
+    x = convert_to_tensor(x)
+    if standardize_dtype(x.dtype) == "int64":
+        dtype = config.floatx()
+    else:
+        dtype = dtypes.result_type(x.dtype, float)
+    x = cast(x, dtype)
+    return jnp.sinc(x)
 
 
 @sparse.elementwise_unary(linear=False)
@@ -912,10 +1352,17 @@ def sort(x, axis=-1):
 
 
 def split(x, indices_or_sections, axis=0):
+    x = convert_to_tensor(x)
     return jnp.split(x, indices_or_sections, axis=axis)
 
 
+def array_split(x, indices_or_sections, axis=0):
+    x = convert_to_tensor(x)
+    return jnp.array_split(x, indices_or_sections, axis=axis)
+
+
 def stack(x, axis=0):
+    x = [convert_to_tensor(t) for t in x]
     return jnp.stack(x, axis=axis)
 
 
@@ -938,6 +1385,8 @@ def take(x, indices, axis=None):
 
 
 def take_along_axis(x, indices, axis=None):
+    x = convert_to_tensor(x)
+    indices = convert_to_tensor(indices, sparse=False)
     return jnp.take_along_axis(x, indices, axis=axis)
 
 
@@ -992,14 +1441,7 @@ def tile(x, repeats):
 
 def trace(x, offset=0, axis1=0, axis2=1):
     x = convert_to_tensor(x)
-    dtype = None
-    # TODO: Remove the condition of uint8 and uint16 once we have jax>=0.4.27
-    # for both CPU & GPU environments.
-    # uint8 and uint16 will be casted to uint32 when jax>=0.4.27 but to int32
-    # otherwise.
-    if standardize_dtype(x.dtype) in ("bool", "uint8", "uint16"):
-        dtype = "int32"
-    return jnp.trace(x, offset=offset, axis1=axis1, axis2=axis2, dtype=dtype)
+    return jnp.trace(x, offset=offset, axis1=axis1, axis2=axis2)
 
 
 def tri(N, M=None, k=0, dtype=None):
@@ -1017,14 +1459,33 @@ def triu(x, k=0):
     return jnp.triu(x, k=k)
 
 
+def trunc(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    if "int" in dtype or "bool" == dtype:
+        return x
+    return jnp.trunc(x)
+
+
 def vdot(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
     return jnp.vdot(x1, x2)
 
 
+def inner(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.inner(x1, x2)
+
+
 def vstack(xs):
     return jnp.vstack(xs)
+
+
+def vsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    return jnp.vsplit(x, indices_or_sections)
 
 
 def vectorize(pyfunc, *, excluded=None, signature=None):
@@ -1033,7 +1494,7 @@ def vectorize(pyfunc, *, excluded=None, signature=None):
     return jnp.vectorize(pyfunc, excluded=excluded, signature=signature)
 
 
-def where(condition, x1, x2):
+def where(condition, x1=None, x2=None):
     return jnp.where(condition, x1, x2)
 
 
@@ -1047,7 +1508,8 @@ def divide(x1, x2):
 def divide_no_nan(x1, x2):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
-    return jnp.where(x2 == 0, 0, jnp.divide(x1, x2))
+    safe_x2 = jnp.where(x2 == 0, 1, x2)
+    return jnp.where(x2 == 0, 0, jnp.divide(x1, safe_x2))
 
 
 def true_divide(x1, x2):
@@ -1064,6 +1526,12 @@ def power(x1, x2):
 def negative(x):
     x = convert_to_tensor(x)
     return jnp.negative(x)
+
+
+def nextafter(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    return jnp.nextafter(x1, x2)
 
 
 @sparse.elementwise_unary(linear=False)
@@ -1086,6 +1554,7 @@ def squeeze(x, axis=None):
             axis = tuple(i for i, d in enumerate(x.shape) if d == 1)
         axis = to_tuple_or_list(axis)
         return jax_sparse.bcoo_squeeze(x, dimensions=axis)
+    x = convert_to_tensor(x)
     return jnp.squeeze(x, axis=axis)
 
 
@@ -1102,6 +1571,19 @@ def transpose(x, axes=None):
                 permutation.append(a)
         return jax_sparse.bcoo_transpose(x, permutation=permutation)
     return jnp.transpose(x, axes=axes)
+
+
+def trapezoid(y, x=None, dx=1.0, axis=-1):
+    y = convert_to_tensor(y)
+    if x is not None:
+        x = convert_to_tensor(x)
+    dx = convert_to_tensor(dx)
+    return jnp.trapezoid(y, x, dx=dx, axis=axis)
+
+
+def vander(x, N=None, increasing=False):
+    x = convert_to_tensor(x)
+    return jnp.vander(x, N=N, increasing=increasing)
 
 
 def var(x, axis=None, keepdims=False):
@@ -1158,6 +1640,11 @@ def logical_xor(x1, x2):
     return jnp.logical_xor(x1, x2)
 
 
+def corrcoef(x):
+    x = convert_to_tensor(x)
+    return jnp.corrcoef(x)
+
+
 def correlate(x1, x2, mode="valid"):
     x1 = convert_to_tensor(x1)
     x2 = convert_to_tensor(x2)
@@ -1174,4 +1661,45 @@ def slogdet(x):
 
 
 def argpartition(x, kth, axis=-1):
-    return jnp.argpartition(x, kth, axis)
+    if axis is None:
+        x = jnp.reshape(x, (-1,))
+        return jnp.argpartition(x, kth, axis=0)
+
+    return jnp.argpartition(x, kth, axis=axis)
+
+
+def histogram(x, bins=10, range=None):
+    return jnp.histogram(x, bins=bins, range=range)
+
+
+def unique(
+    x,
+    sorted=True,
+    return_index=False,
+    return_inverse=False,
+    return_counts=False,
+    axis=None,
+    size=None,
+    fill_value=None,
+):
+    return jnp.unique(
+        x,
+        return_index=return_index,
+        return_inverse=return_inverse,
+        return_counts=return_counts,
+        axis=axis,
+        equal_nan=False,
+        size=size,
+        sorted=sorted,
+        fill_value=fill_value,
+    )
+
+
+def dsplit(x, indices_or_sections):
+    x = convert_to_tensor(x)
+    return jnp.dsplit(x, indices_or_sections)
+
+
+def column_stack(xs):
+    xs = [convert_to_tensor(x) for x in xs]
+    return jnp.column_stack(xs)

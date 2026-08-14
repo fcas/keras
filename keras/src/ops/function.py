@@ -4,6 +4,7 @@ from keras.src import tree
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
 from keras.src.backend.config import backend
+from keras.src.backend.config import is_nnx_enabled
 from keras.src.ops.operation import Operation
 
 
@@ -82,6 +83,18 @@ class Function(Operation):
         self._operations = operations
         self._operations_by_depth = operations_by_depth
 
+        # Run through graph to check all outputs are connected to the inputs.
+        def empty_op_outputs(op, *args, **kwargs):
+            return [None] * len(tree.flatten(op.output))
+
+        self._run_through_graph(
+            [None] * len(self._inputs), call_fn=empty_op_outputs
+        )
+
+        # Special handling for NNX to ensure consistent operation instance usage
+        if is_nnx_enabled():
+            self._setup_nnx_op_mapping()
+
     @property
     def operations(self):
         return self._operations[:]
@@ -95,6 +108,26 @@ class Function(Operation):
     def outputs(self):
         """Flat list of the symbolic outputs of the Function."""
         return self._outputs
+
+    def _setup_nnx_op_mapping(self):
+        """Setup operation mapping for NNX"""
+        # Create a mapping from operation id to operation instance
+        self._nnx_op_mapping = {}
+
+        # Assign the list of operations to a single attribute for NNX traversal
+        self.nnx_operations = self._operations[:]
+        for operation in self._operations:
+            # Map the operation id to this operation instance
+            self._nnx_op_mapping[id(operation)] = operation
+
+    def _get_operation_for_node(self, node):
+        """Get the operation for a node, using NNX mapping if enabled."""
+        operation = node.operation
+        if hasattr(self, "_nnx_op_mapping") and id(operation) in getattr(
+            self, "_nnx_op_mapping", {}
+        ):
+            return self._nnx_op_mapping[id(operation)]
+        return operation
 
     def compute_output_spec(self, inputs):
         self._assert_input_compatibility(inputs)
@@ -118,12 +151,28 @@ class Function(Operation):
             inputs, operation_fn=lambda op: op.compute_output_spec
         )
 
+    def compute_output_shape(self, input_shape):
+        # Wrap `input_shape` into the structure of KerasTensor to utilize
+        # `compute_output_spec`.
+        input_shape_struct = tree.map_shape_structure(
+            lambda x: KerasTensor(shape=x), input_shape
+        )
+        # Ensure that dtype and sparse settings are the same as self._inputs,
+        # because we only care about the shape in this function.
+        for x, x_ref in zip(tree.flatten(input_shape_struct), self._inputs):
+            x._dtype = x_ref.dtype
+            x._sparse = x_ref.sparse
+        output_spec = self.compute_output_spec(input_shape_struct)
+        return tree.map_structure(lambda x: x.shape, output_spec)
+
     def call(self, inputs):
         """Computes output tensors for new inputs."""
         self._assert_input_compatibility(inputs)
-        return self._run_through_graph(inputs, operation_fn=lambda op: op)
+        return self._run_through_graph(inputs)
 
-    def _run_through_graph(self, inputs, operation_fn, call_fn=None):
+    def _run_through_graph(
+        self, inputs, operation_fn=lambda op: op, call_fn=None
+    ):
         """Execute the graph.
 
         At each node we compute outputs via
@@ -150,10 +199,14 @@ class Function(Operation):
                     continue  # Node is not computable, try skipping.
 
                 args, kwargs = node.arguments.fill_in(tensor_dict)
-                op = operation_fn(node.operation)
                 if call_fn is not None:
+                    # Use call_fn if provided (e.g., for symbolic execution)
+                    op = operation_fn(node.operation)
                     outputs = call_fn(op, *args, **kwargs)
                 else:
+                    # Use NNX operation mapping
+                    operation = self._get_operation_for_node(node)
+                    op = operation_fn(operation)
                     outputs = op(*args, **kwargs)
 
                 # Update tensor_dict.
@@ -161,16 +214,20 @@ class Function(Operation):
                     tensor_dict[id(x)] = y
 
         output_tensors = []
-        for x in self.outputs:
+        for i, x in enumerate(self.outputs):
+            if id(x) not in tensor_dict:
+                path = tree.flatten_with_path(self._outputs_struct)[i][0]
+                path = ".".join(str(p) for p in path)
+                raise ValueError(
+                    f"Output with path `{path}` is not connected to `inputs`"
+                )
             output_tensors.append(tensor_dict[id(x)])
 
         return tree.pack_sequence_as(self._outputs_struct, output_tensors)
 
     def _assert_input_compatibility(self, inputs):
         try:
-            tree.assert_same_structure(
-                inputs, self._inputs_struct, check_types=False
-            )
+            tree.assert_same_structure(inputs, self._inputs_struct)
         except ValueError:
             raise ValueError(
                 "Function was called with an invalid input structure. "
@@ -197,7 +254,7 @@ class Function(Operation):
 
 
 def make_node_key(op, node_index):
-    return str(id(op)) + "_ib-" + str(node_index)
+    return f"{id(op)}_ib-{node_index}"
 
 
 def map_graph(inputs, outputs):
@@ -218,6 +275,7 @@ def map_graph(inputs, outputs):
     # "depth" is number of operations between output Node and the Node.
     # Nodes are ordered from inputs -> outputs.
     nodes_in_decreasing_depth, operation_indices = _build_map(inputs, outputs)
+    nodes_in_graph = set(nodes_in_decreasing_depth)
     network_nodes = {
         make_node_key(node.operation, node.operation._inbound_nodes.index(node))
         for node in nodes_in_decreasing_depth
@@ -243,7 +301,10 @@ def map_graph(inputs, outputs):
         # Update the depth of inbound nodes.
         # The "depth" of a node is the max of the depths
         # of all nodes it is connected to + 1.
+        # Only update nodes that are actually part of the graph.
         for node_dep in node.parent_nodes:
+            if node_dep not in nodes_in_graph:
+                continue
             previous_depth = nodes_depths.get(node_dep, 0)
             nodes_depths[node_dep] = max(depth + 1, previous_depth)
 
@@ -253,10 +314,16 @@ def map_graph(inputs, outputs):
     for input_t in inputs:
         input_operation = input_t._keras_history[0]
         if input_operation and input_operation not in operations_depths:
-            operations_depths[input_operation] = 0
-            operation_indices[input_operation] = -1
-            nodes_depths[input_operation._inbound_nodes[0]] = 0
-            network_nodes.add(make_node_key(input_operation, 0))
+            node_index = input_t._keras_history.node_index
+            node = input_operation._inbound_nodes[node_index]
+            # Add InputLayer operations (unused inputs) unconditionally.
+            # Skip non-InputLayer operations, as they produce intermediate
+            # tensors used as Function inputs and are outside the graph.
+            if node.is_input:
+                operations_depths[input_operation] = 0
+                operation_indices[input_operation] = -1
+                nodes_depths[node] = 0
+                network_nodes.add(make_node_key(input_operation, node_index))
 
     # Build a dict {depth: list of nodes with this depth}
     nodes_by_depth = collections.defaultdict(list)
@@ -304,7 +371,7 @@ def map_graph(inputs, outputs):
                         "The following previous operations were accessed "
                         f"without issue: {operations_with_complete_input}"
                     )
-                operations_with_complete_input.append(operation.name)
+                operations_with_complete_input.append(node.operation.name)
 
             for x in tree.flatten(node.outputs):
                 computable_tensors.add(x)
@@ -382,6 +449,14 @@ def _build_map_helper(
     if node in finished_nodes:
         return
 
+    # If this tensor is one of the declared inputs and its producing
+    # operation is not an InputLayer, stop traversal here. The operation
+    # that produced this tensor is outside the Function's graph.
+    flat_inputs = tree.flatten(inputs)
+    if not node.is_input and tensor in flat_inputs:
+        finished_nodes.add(node)
+        return
+
     # Prevent cycles.
     if node in nodes_in_progress:
         raise ValueError(
@@ -395,11 +470,11 @@ def _build_map_helper(
 
     # Propagate to all previous tensors connected to this node.
     nodes_in_progress.add(node)
-    if not node.is_input and tensor not in tree.flatten(inputs):
-        for tensor in node.input_tensors:
+    if not node.is_input:
+        for input_tensor in node.input_tensors:
             _build_map_helper(
                 inputs,
-                tensor,
+                input_tensor,
                 finished_nodes,
                 nodes_in_progress,
                 nodes_in_decreasing_depth,

@@ -32,16 +32,105 @@ class KerasTensor:
         shape,
         dtype="float32",
         sparse=False,
+        ragged=False,
         record_history=True,
         name=None,
+        **kwargs,
     ):
         from keras.src import backend
 
-        self.shape = backend.standardize_shape(shape)
-        self.dtype = backend.standardize_dtype(dtype)
-        self.sparse = sparse
+        ragged_rank = kwargs.pop("ragged_rank", None)
+        row_splits_dtype = kwargs.pop("row_splits_dtype", None)
+        if kwargs:
+            raise TypeError(
+                f"Unexpected keyword arguments: {', '.join(kwargs.keys())}"
+            )
+
+        self._shape = backend.standardize_shape(shape)
+        self._dtype = backend.standardize_dtype(dtype)
+        self._sparse = bool(sparse)
+        self._ragged = bool(ragged)
+        if self._sparse and self._ragged:
+            raise ValueError(
+                "KerasTensor cannot have `sparse=True` and `ragged=True` at "
+                "the same time."
+            )
+        self._ragged_rank = (
+            int(ragged_rank) if ragged_rank is not None else None
+        )
+        self._row_splits_dtype = (
+            backend.standardize_dtype(row_splits_dtype)
+            if row_splits_dtype is not None
+            else None
+        )
         self.name = name or auto_name(self.__class__.__name__)
         self.record_history = record_history
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @shape.setter
+    def shape(self, value):
+        raise AttributeError(
+            "The `shape` attribute of KerasTensor is immutable. One should "
+            "create a new instance of KerasTensor for this."
+        )
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @dtype.setter
+    def dtype(self, value):
+        raise AttributeError(
+            "The `dtype` attribute of KerasTensor is immutable. One should "
+            "create a new instance of KerasTensor for this."
+        )
+
+    @property
+    def sparse(self):
+        return self._sparse
+
+    @sparse.setter
+    def sparse(self, value):
+        raise AttributeError(
+            "The `sparse` attribute of KerasTensor is immutable. One should "
+            "create a new instance of KerasTensor for this."
+        )
+
+    @property
+    def ragged_rank(self):
+        return self._ragged_rank
+
+    @ragged_rank.setter
+    def ragged_rank(self, value):
+        raise AttributeError(
+            "The `ragged_rank` attribute of KerasTensor is immutable. One "
+            "should create a new instance of KerasTensor for this."
+        )
+
+    @property
+    def row_splits_dtype(self):
+        return self._row_splits_dtype
+
+    @row_splits_dtype.setter
+    def row_splits_dtype(self, value):
+        raise AttributeError(
+            "The `row_splits_dtype` attribute of KerasTensor is immutable. One "
+            "should create a new instance of KerasTensor for this."
+        )
+
+    @property
+    def ragged(self):
+        return self._ragged
+
+    @ragged.setter
+    def ragged(self, value):
+        raise AttributeError(
+            "The `ragged` attribute of KerasTensor is immutable. One should "
+            "create a new instance of KerasTensor for this."
+        )
 
     @property
     def ndim(self):
@@ -57,6 +146,20 @@ class KerasTensor:
 
         return ops.Squeeze(axis)(self)
 
+    def __int__(self):
+        raise ValueError(
+            "A KerasTensor is symbolic: it's a placeholder for a shape "
+            "an a dtype. It doesn't have any actual numerical value. "
+            "You cannot convert it to an int."
+        )
+
+    def __float__(self):
+        raise ValueError(
+            "A KerasTensor is symbolic: it's a placeholder for a shape "
+            "an a dtype. It doesn't have any actual numerical value. "
+            "You cannot convert it to a float."
+        )
+
     def __array__(self):
         raise ValueError(
             "A KerasTensor is symbolic: it's a placeholder for a shape "
@@ -71,7 +174,7 @@ class KerasTensor:
             "used when constructing Keras Functional models "
             "or Keras Functions. You can only use it as input to a Keras layer "
             "or a Keras operation (from the namespaces `keras.layers` "
-            "and `keras.operations`). "
+            "and `keras.ops`). "
             "You are likely doing something like:\n\n"
             "```\n"
             "x = Input(...)\n"
@@ -94,7 +197,7 @@ class KerasTensor:
             "used when constructing Keras Functional models "
             "or Keras Functions. You can only use it as input to a Keras layer "
             "or a Keras operation (from the namespaces `keras.layers` "
-            "and `keras.operations`). "
+            "and `keras.ops`). "
             "You are likely doing something like:\n\n"
             "```\n"
             "x = Input(...)\n"
@@ -113,7 +216,7 @@ class KerasTensor:
     def __repr__(self):
         return (
             f"<KerasTensor shape={self.shape}, dtype={self.dtype}, "
-            f"sparse={self.sparse}, name={self.name}>"
+            f"sparse={self.sparse}, ragged={self.ragged}, name={self.name}>"
         )
 
     def __iter__(self):
@@ -289,13 +392,22 @@ class KerasTensor:
 
         return ops.GetItem().symbolic_call(self, key)
 
+    def __round__(self, ndigits=None):
+        from keras.src import ops
+
+        decimals = ndigits or 0
+        return ops.Round(decimals=decimals).symbolic_call(self)
+
 
 def any_symbolic_tensors(args=None, kwargs=None):
-    args = args or ()
-    kwargs = kwargs or {}
-    for x in tree.flatten((args, kwargs)):
-        if isinstance(x, KerasTensor):
-            return True
+    for items in (args or (), kwargs.values() if kwargs else ()):
+        for x in items:
+            if isinstance(x, KerasTensor):
+                return True
+            if tree.is_nested(x):
+                for nested in tree.flatten(x):
+                    if isinstance(nested, KerasTensor):
+                        return True
     return False
 
 

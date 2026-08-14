@@ -2,9 +2,11 @@ import copy
 import inspect
 import typing
 
+from keras.src import backend
 from keras.src import tree
 from keras.src.api_export import keras_export
 from keras.src.backend.common import global_state
+from keras.src.backend.common import standardize_shape
 from keras.src.layers.core.input_layer import InputLayer
 from keras.src.layers.layer import Layer
 from keras.src.legacy.saving import saving_utils
@@ -62,7 +64,7 @@ class Sequential(Model):
     """
 
     def __new__(cls, *args, **kwargs):
-        return typing.cast(Sequential, super().__new__(cls))
+        return typing.cast(cls, super().__new__(cls))
 
     def __init__(self, layers=None, trainable=True, name=None):
         super().__init__(trainable=trainable, name=name)
@@ -123,7 +125,15 @@ class Sequential(Model):
             self._functional = None
 
     def pop(self, rebuild=True):
-        """Removes the last layer in the model."""
+        """Removes the last layer in the model.
+
+        Args:
+            rebuild: `bool`. Whether to rebuild the model after removing
+            the layer. Defaults to `True`.
+
+        Returns:
+            layer: layer instance.
+        """
         layer = self._layers.pop()
         self.built = False
         self._functional = None
@@ -137,6 +147,12 @@ class Sequential(Model):
         if isinstance(self._layers[0], InputLayer) and len(self._layers) > 1:
             input_shape = self._layers[0].batch_shape
             self.build(input_shape)
+        elif hasattr(self._layers[0], "input_shape") and len(self._layers) > 1:
+            # We can build the Sequential model if the first layer has the
+            # `input_shape` property. This is most commonly found in Functional
+            # model.
+            input_shape = self._layers[0].input_shape
+            self.build(input_shape)
 
     def _lock_state(self):
         # Unlike other layers, Sequential is mutable after build.
@@ -146,13 +162,9 @@ class Sequential(Model):
         return "Sequential"
 
     def build(self, input_shape=None):
-        if not isinstance(input_shape, (tuple, list)):
-            # Do not attempt to build if the model does not have a single
-            # input tensor.
-            return
-        if input_shape and not (
-            isinstance(input_shape[0], int) or input_shape[0] is None
-        ):
+        try:
+            input_shape = standardize_shape(input_shape)
+        except:
             # Do not attempt to build if the model does not have a single
             # input tensor.
             return
@@ -190,19 +202,37 @@ class Sequential(Model):
                 positional_args = [
                     param
                     for param in signature.parameters.values()
+                    if param.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+                required_positional_args = [
+                    param
+                    for param in positional_args
                     if param.default == inspect.Parameter.empty
                 ]
-                if len(positional_args) != 1:
+                if not positional_args:
                     raise ValueError(
-                        "Layers added to a Sequential model "
-                        "can only have a single positional argument, "
-                        f"the input tensor. Layer {layer.__class__.__name__} "
-                        f"has multiple positional arguments: {positional_args}"
+                        "Layers added to a Sequential model should "
+                        "have a single positional argument, the "
+                        "input tensor. Layer "
+                        f"{layer.__class__.__name__} has no "
+                        "positional arguments."
+                    )
+                if len(required_positional_args) > 1:
+                    raise ValueError(
+                        "Layers added to a Sequential model can "
+                        "only have a single required positional "
+                        "argument, the input tensor. Layer "
+                        f"{layer.__class__.__name__} has multiple "
+                        "required positional arguments: "
+                        f"{required_positional_args}"
                     )
                 raise e
         outputs = x
         self._functional = Functional(inputs=inputs, outputs=outputs)
-        self.built = True
 
     def call(self, inputs, training=None, mask=None):
         if self._functional:
@@ -215,18 +245,13 @@ class Sequential(Model):
             # `outputs` are the outputs of `layer` applied to `inputs`. At the
             # end of each iteration `inputs` is set to `outputs` to prepare for
             # the next layer.
-            kwargs = {}
             if layer._call_has_mask_arg:
-                kwargs["mask"] = mask
-            if layer._call_has_training_arg and training is not None:
-                kwargs["training"] = training
-            outputs = layer(inputs, **kwargs)
+                outputs = layer(inputs, mask=mask)
+            else:
+                outputs = layer(inputs)
             inputs = outputs
 
-            def _get_mask_from_keras_tensor(kt):
-                return getattr(kt, "_keras_mask", None)
-
-            mask = tree.map_structure(_get_mask_from_keras_tensor, outputs)
+            mask = tree.map_structure(backend.get_keras_mask, outputs)
         return outputs
 
     @property
@@ -239,24 +264,42 @@ class Sequential(Model):
             return layers[1:]
         return layers[:]
 
-    def compute_output_spec(self, inputs, training=None, mask=None):
+    @layers.setter
+    def layers(self, _):
+        raise AttributeError(
+            "`Sequential.layers` attribute is reserved and should not be used. "
+            "Use `add()` and `pop()` to change the layers in this model."
+        )
+
+    def compute_output_spec(self, inputs, training=None, mask=None, **kwargs):
         if self._functional:
             return self._functional.compute_output_spec(
-                inputs, training=training, mask=mask
+                inputs, training=training, mask=mask, **kwargs
             )
         # Direct application
         for layer in self.layers:
             outputs = layer.compute_output_spec(
-                inputs, training=training
+                inputs,
+                training=training,
+                **kwargs,
             )  # Ignore mask
             inputs = outputs
         return outputs
+
+    def compute_output_shape(self, input_shape):
+        if self._functional:
+            return self._functional.compute_output_shape(input_shape)
+        # Direct application
+        for layer in self.layers:
+            output_shape = layer.compute_output_shape(input_shape)
+            input_shape = output_shape
+        return output_shape
 
     @property
     def input_shape(self):
         if self._functional:
             return self._functional.input_shape
-        raise ValueError(
+        raise AttributeError(
             f"Sequential model '{self.name}' has no defined input shape yet."
         )
 
@@ -264,7 +307,7 @@ class Sequential(Model):
     def output_shape(self):
         if self._functional:
             return self._functional.output_shape
-        raise ValueError(
+        raise AttributeError(
             f"Sequential model '{self.name}' has no defined output shape yet."
         )
 
@@ -272,7 +315,7 @@ class Sequential(Model):
     def inputs(self):
         if self._functional:
             return self._functional.inputs
-        raise ValueError(
+        raise AttributeError(
             f"Sequential model '{self.name}' has no defined inputs yet."
         )
 
@@ -280,7 +323,7 @@ class Sequential(Model):
     def outputs(self):
         if self._functional:
             return self._functional.outputs
-        raise ValueError(
+        raise AttributeError(
             f"Sequential model '{self.name}' has no defined outputs yet."
         )
 
@@ -323,8 +366,11 @@ class Sequential(Model):
             build_input_shape = config.get("build_input_shape")
             layer_configs = config["layers"]
         else:
-            name = None
-            layer_configs = config
+            raise ValueError(
+                "A Sequential model configuration must be "
+                "a dictionary containing the 'name' and "
+                f"'layers' keys. Received: config={config}"
+            )
         model = cls(name=name)
         for layer_config in layer_configs:
             if "module" not in layer_config:
@@ -342,6 +388,7 @@ class Sequential(Model):
             model.add(layer)
         if (
             not model._functional
+            and "build_input_shape" in locals()
             and build_input_shape
             and isinstance(build_input_shape, (tuple, list))
         ):

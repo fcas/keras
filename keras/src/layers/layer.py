@@ -17,6 +17,7 @@ And some more magic:
 """
 
 import collections
+import functools
 import inspect
 import warnings
 from functools import wraps
@@ -25,18 +26,26 @@ from keras.src import backend
 from keras.src import constraints
 from keras.src import dtype_policies
 from keras.src import initializers
+from keras.src import ops
 from keras.src import regularizers
 from keras.src import tree
 from keras.src import utils
 from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
 from keras.src.backend.common import global_state
+from keras.src.backend.common import remat
+from keras.src.backend.common.keras_tensor import any_symbolic_tensors
 from keras.src.backend.common.name_scope import current_path
+from keras.src.backend.common.remat import get_current_remat_mode
+from keras.src.backend.common.symbolic_scope import in_symbolic_scope
+from keras.src.backend.config import is_nnx_enabled
 from keras.src.distribution import distribution_lib
+from keras.src.dtype_policies import DTypePolicyMap
 from keras.src.layers import input_spec
 from keras.src.metrics.metric import Metric
+from keras.src.ops.node import Node
 from keras.src.ops.operation import Operation
-from keras.src.saving.keras_saveable import KerasSaveable
+from keras.src.quantizers.quantization_config import validate_and_resolve_config
 from keras.src.utils import python_utils
 from keras.src.utils import summary_utils
 from keras.src.utils import traceback_utils
@@ -50,6 +59,8 @@ elif backend.backend() == "torch":
     from keras.src.backend.torch.layer import TorchLayer as BackendLayer
 elif backend.backend() == "numpy":
     from keras.src.backend.numpy.layer import NumpyLayer as BackendLayer
+elif backend.backend() == "openvino":
+    from keras.src.backend.openvino.layer import OpenvinoLayer as BackendLayer
 else:
     raise RuntimeError(
         f"Backend '{backend.backend()}' must implement a layer mixin class."
@@ -57,7 +68,7 @@ else:
 
 
 @keras_export(["keras.Layer", "keras.layers.Layer"])
-class Layer(BackendLayer, Operation, KerasSaveable):
+class Layer(BackendLayer, Operation):
     """This is the class from which all layers inherit.
 
     A layer is a callable object that takes as input one or more tensors and
@@ -81,12 +92,10 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         trainable: Boolean, whether the layer's variables should be trainable.
         name: String name of the layer.
         dtype: The dtype of the layer's computations and weights. Can also be a
-            `keras.DTypePolicy`,
-            which allows the computation and
-            weight dtype to differ. Defaults to `None`. `None` means to use
-            `keras.config.dtype_policy()`,
-            which is a `float32` policy unless set to different value
-            (via `keras.config.set_dtype_policy()`).
+            `keras.DTypePolicy`, which allows the computation and weight dtype
+            to differ. Defaults to `None`. `None` means to use
+            `keras.config.dtype_policy()`, which is a `float32` policy unless
+            set to different value (via `keras.config.set_dtype_policy()`).
 
     Attributes:
         name: The name of the layer (string).
@@ -211,15 +220,15 @@ class Layer(BackendLayer, Operation, KerasSaveable):
     """
 
     def __new__(cls, *args, **kwargs):
-        # Wrap the user-provided build method in the build_decorator
-        # to add name scope support and serialization support.
         obj = super().__new__(cls, *args, **kwargs)
-
+        # Wrap the user-provided `build` method in the `build_wrapper`
+        # to add name scope support and serialization support.
         original_build_method = obj.build
 
         @wraps(original_build_method)
         def build_wrapper(*args, **kwargs):
             with obj._open_name_scope():
+                obj._path = current_path()
                 original_build_method(*args, **kwargs)
             # Record build config.
             signature = inspect.signature(original_build_method)
@@ -230,6 +239,27 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             obj._lock_state()
 
         obj.build = build_wrapper
+
+        # Wrap the user-provided `quantize` method in the `quantize_wrapper`
+        # to add tracker support.
+        original_quantize_method = obj.quantize
+
+        @wraps(original_quantize_method)
+        def quantize_wrapper(mode=None, config=None, **kwargs):
+            config = validate_and_resolve_config(mode, config)
+            mode = config.mode
+            obj._check_quantize_args(mode, obj.compute_dtype)
+            obj._tracker.unlock()
+            try:
+                result = original_quantize_method(
+                    mode=mode, config=config, **kwargs
+                )
+            finally:
+                obj._tracker.lock()
+            return result
+
+        obj.quantize = quantize_wrapper
+
         return obj
 
     def __init__(
@@ -244,7 +274,8 @@ class Layer(BackendLayer, Operation, KerasSaveable):
     ):
         BackendLayer.__init__(self)
         self._lock = False
-        Operation.__init__(self, dtype=dtype, name=name)
+        Operation.__init__(self, name=name)
+        self._dtype_policy = dtype_policies.get(dtype)
         self.activity_regularizer = regularizers.get(activity_regularizer)
         input_dim_arg = kwargs.pop("input_dim", None)
         if input_dim_arg is not None:
@@ -266,23 +297,41 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 f"passed to {self.__class__.__name__}: {kwargs}"
             )
 
+        self._path = None  # Will be determined in `build_wrapper`
         self.built = False
         self.autocast = autocast
         self._input_spec = None
         self._called = False
         self.supports_jit = True
 
+        if not isinstance(trainable, bool):
+            raise ValueError(
+                "Expected `trainable` to be a boolean. "
+                f"Received: trainable={trainable} (of type "
+                f"{type(trainable)})"
+            )
         self._trainable = trainable
         self._losses = []
         self._loss_ids = set()
         self._losses_override = []
 
         self._call_signature = inspect.signature(self.call)
-        call_signature_parameters = [
+        self.call_signature_parameters = [
             p.name for p in self._call_signature.parameters.values()
         ]
-        self._call_has_training_arg = "training" in call_signature_parameters
-        self._call_has_mask_arg = "mask" in call_signature_parameters
+        self._call_has_training_arg = (
+            "training" in self.call_signature_parameters
+        )
+        self._call_has_mask_arg = "mask" in self.call_signature_parameters
+
+        # 1. collect names that should be auto‑propagated
+        self._call_context_args = {"training"}
+
+        # 2. remember which of them exist in *this* call signature
+        self._call_has_context_arg = {
+            arg: (arg in self.call_signature_parameters)
+            for arg in self._call_context_args
+        }
 
         self._supports_masking = not utils.is_default(self.compute_mask)
         # Whether to automatically convert (+ auto-cast) inputs to `call()`.
@@ -312,14 +361,16 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                     trainable_variables,
                 ),
                 "non_trainable_variables": (
-                    lambda x: isinstance(x, backend.Variable)
-                    and not x.trainable,
+                    lambda x: (
+                        isinstance(x, backend.Variable) and not x.trainable
+                    ),
                     non_trainable_variables,
                 ),
                 "metrics": (lambda x: isinstance(x, Metric), metrics),
                 "layers": (
-                    lambda x: isinstance(x, Layer)
-                    and not isinstance(x, Metric),
+                    lambda x: (
+                        isinstance(x, Layer) and not isinstance(x, Metric)
+                    ),
                     layers,
                 ),
                 "seed_generators": (
@@ -345,6 +396,26 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         if backend.backend() == "tensorflow":
             # Reset attribute tracking (TF-specific)
             self._self_setattr_tracking = _self_setattr_tracking
+
+    def _build_at_init(self):
+        """Build the layer at `Layer.__init__`.
+
+        We can only safely mark the layer as `built=True` in `Layer.__init__` if
+        `build` is not overridden. Otherwise, it might cause the subclasses to
+        ignore the user's `build`.
+        """
+        if utils.is_default(self.build):
+            self.built = True
+            self._post_build()
+            self._lock_state()
+
+    @property
+    def path(self):
+        """The path of the layer.
+
+        If the layer has not been built yet, it will be `None`.
+        """
+        return self._path
 
     @property
     def input_spec(self):
@@ -421,7 +492,6 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 self.build(config["input_shape"])
             elif "shapes_dict" in config:
                 self.build(**config["shapes_dict"])
-            self.built = True
 
     def _obj_type(self):
         return "Layer"
@@ -454,6 +524,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
 
     def add_weight(
         self,
+        *args,
         shape=None,
         initializer=None,
         dtype=None,
@@ -461,7 +532,8 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         autocast=True,
         regularizer=None,
         constraint=None,
-        aggregation="mean",
+        aggregation="none",
+        overwrite_with_gradient=False,
         name=None,
     ):
         """Add a weight variable to the layer.
@@ -488,13 +560,53 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             constraint: Contrainst object to call on the variable after any
                 optimizer update, or string name of a built-in constraint.
                 Defaults to `None`.
-            aggregation: String, one of `'mean'`, `'sum'`,
-                `'only_first_replica'`. Annotates the variable with the type
-                of multi-replica aggregation to be used for this variable
-                when writing custom data parallel training loops.
+            aggregation: Optional string, one of `None`, `"none"`, `"mean"`,
+                `"sum"` or `"only_first_replica"`. Annotates the variable with
+                the type of multi-replica aggregation to be used for this
+                variable when writing custom data parallel training loops.
+                Defaults to `"none"`.
+            overwrite_with_gradient: Boolean, whether to overwrite the variable
+                with the computed gradient. This is useful for float8 training.
+                Defaults to `False`.
             name: String name of the variable. Useful for debugging purposes.
         """
         self._check_super_called()
+        if args:
+            # `args` is only kept to detect the legacy Keras 2 call style
+            # (`add_weight(shape, initializer, dtype, ...)`) and raise a clear
+            # error for positional `name`.
+            if len(args) > 3:
+                raise TypeError(
+                    "add_weight() takes at most 3 positional arguments "
+                    f"but {len(args)} were given."
+                )
+            shape_arg = args[0]
+            if isinstance(shape_arg, str):
+                raise ValueError(
+                    "`name` must be passed as a keyword argument. "
+                    f"Received: add_weight('{shape_arg}', ...). "
+                    f"Use: add_weight(shape=..., name='{shape_arg}')."
+                )
+            if shape is not None:
+                raise ValueError(
+                    "`shape` was passed both positionally and as "
+                    "a keyword argument."
+                )
+            shape = shape_arg
+            if len(args) > 1:
+                if initializer is not None:
+                    raise ValueError(
+                        "`initializer` was passed both positionally and "
+                        "as a keyword argument."
+                    )
+                initializer = args[1]
+            if len(args) > 2:
+                if dtype is not None:
+                    raise ValueError(
+                        "`dtype` was passed both positionally and as a "
+                        "keyword argument."
+                    )
+                dtype = args[2]
         if shape is None:
             shape = ()
         if dtype is not None:
@@ -507,7 +619,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             else:
                 initializer = "zeros"
         initializer = initializers.get(initializer)
-        with self._open_name_scope():
+        with backend.name_scope(self.name, caller=self):
             variable = backend.Variable(
                 initializer=initializer,
                 shape=shape,
@@ -520,6 +632,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         # Will be added to layer.losses
         variable.regularizer = regularizers.get(regularizer)
         variable.constraint = constraints.get(constraint)
+        variable.overwrite_with_gradient = overwrite_with_gradient
         self._track_variable(variable)
         return variable
 
@@ -683,10 +796,25 @@ class Layer(BackendLayer, Operation, KerasSaveable):
 
     @dtype_policy.setter
     def dtype_policy(self, value):
-        self._dtype_policy = dtype_policies.get(value)
-        if isinstance(self._dtype_policy, dtype_policies.QuantizedDTypePolicy):
-            if self.built:
-                self.quantize(self._dtype_policy.quantization_mode)
+        policy = dtype_policies.get(value)
+        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
+            if self.path in self._dtype_policy:
+                del self._dtype_policy[self.path]
+            self._dtype_policy[self.path] = policy
+        else:
+            self._dtype_policy = policy
+        if policy.quantization_mode is not None:
+            if self.built and not getattr(self, "_is_quantized", False):
+                if policy.quantization_mode == "gptq":
+                    raise ValueError(
+                        "Implicitly enabling GPTQ quantization by setting "
+                        f"`dtype_policy` to '{value}' is not supported. "
+                        "GPTQ requires a calibration dataset and a "
+                        "`GPTQConfig` object.\n\n"
+                        "Please use the `.quantize('gptq', config=...)` method "
+                        "on the layer or model instead."
+                    )
+                self.quantize(policy.quantization_mode)
 
     @property
     def dtype(self):
@@ -696,17 +824,34 @@ class Layer(BackendLayer, Operation, KerasSaveable):
     @property
     def compute_dtype(self):
         """The dtype of the computations performed by the layer."""
-        return self.dtype_policy.compute_dtype
+        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
+            policy = self._dtype_policy[self.path]
+        else:
+            policy = self._dtype_policy
+        return policy.compute_dtype
 
     @property
     def variable_dtype(self):
         """The dtype of the state (weights) of the layer."""
-        return self.dtype_policy.variable_dtype
+        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
+            policy = self._dtype_policy[self.path]
+        else:
+            policy = self._dtype_policy
+        return policy.variable_dtype
+
+    @property
+    def quantization_mode(self):
+        """The quantization mode of this layer, `None` if not quantized."""
+        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
+            policy = self._dtype_policy[self.path]
+        else:
+            policy = self._dtype_policy
+        return policy.quantization_mode
 
     @property
     def input_dtype(self):
         """The dtype layer inputs should be converted to."""
-        return self.dtype_policy.compute_dtype
+        return self.compute_dtype
 
     @property
     def supports_masking(self):
@@ -721,23 +866,35 @@ class Layer(BackendLayer, Operation, KerasSaveable):
     def compute_mask(self, inputs, previous_mask):
         return previous_mask
 
+    def symbolic_call(self, *args, **kwargs):
+        # Node is created at the end of `__call__` instead of `symbolic_call`.
+        return self.compute_output_spec(*args, **kwargs)
+
     @traceback_utils.filter_traceback
     def __call__(self, *args, **kwargs):
         self._check_super_called()
         self._called = True
 
-        #####################################
+        original_args = args
+        original_kwargs = kwargs
+
+        #############################################################
         # 1. Convert any array arguments to tensors of correct dtype.
         def maybe_convert(x):
-            return self.dtype_policy.convert_input(
+            # Prevent _keras_mask from disappearing
+            mask = backend.get_keras_mask(x)
+            y = self.dtype_policy.convert_input(
                 x, self.autocast, self.input_dtype
             )
+            if mask is not None:
+                backend.set_keras_mask(y, mask)
+            return y
 
         # Used to avoid expensive `tree` operations in the most common case.
         if (
             kwargs
             or len(args) != 1
-            or not backend.is_tensor(args[0])
+            or not is_backend_tensor_or_symbolic(args[0], allow_none=False)
             or backend.standardize_dtype(args[0].dtype) != self.input_dtype
         ) and self._convert_input_args:
             args = tree.map_structure(maybe_convert, args)
@@ -747,11 +904,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         # 2. Enforce that only tensors can be passed positionally.
         if not self._allow_non_tensor_positional_args:
             for arg in tree.flatten(args):
-                if (
-                    not isinstance(arg, KerasTensor)
-                    and not backend.is_tensor(arg)
-                    and arg is not None
-                ):
+                if not is_backend_tensor_or_symbolic(arg, allow_none=True):
                     raise ValueError(
                         "Only input tensors may be passed as "
                         "positional arguments. The following argument value "
@@ -760,7 +913,9 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                     )
 
         # Caches info about `call()` signature, args, kwargs.
-        call_spec = CallSpec(self._call_signature, args, kwargs)
+        call_spec = CallSpec(
+            self._call_signature, self._call_context_args, args, kwargs
+        )
 
         ############################################
         # 3. Check input spec for 1st positional arg.
@@ -784,18 +939,10 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         # across nested calls.
         call_context = self._get_call_context()
 
-        # This is the value explicitly passed by the user
-        training = call_spec.user_arguments_dict.get("training", None)
-        if training is None:
-            # Wasn't passed explicitly: use context value
-            training = call_context.training
-            if training is None:
-                # Get signature default value
-                training = call_spec.arguments_dict.get("training", None)
-        call_context.training = training
-        if self._call_has_training_arg and training is not None:
-            # Only populate arg if it has a concrete value
-            kwargs["training"] = training
+        for context_arg in self._call_context_args:
+            self._resolve_and_populate_arg(
+                context_arg, call_spec, call_context, kwargs
+            )
 
         ##############################
         # 6. Populate mask argument(s)
@@ -807,7 +954,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 arg_name = list(call_spec.tensor_arguments_dict.keys())[0]
                 only_tensor_arg = call_spec.tensor_arguments_dict[arg_name]
                 mask = tree.map_structure(
-                    lambda x: getattr(x, "_keras_mask", None),
+                    backend.get_keras_mask,
                     only_tensor_arg,
                 )
                 kwargs["mask"] = mask
@@ -816,10 +963,19 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 expected_mask_arg_name = f"{k}_mask"
                 if expected_mask_arg_name in call_spec.argument_names:
                     if call_spec.arguments_dict[expected_mask_arg_name] is None:
-                        mask = tree.map_structure(
-                            lambda x: getattr(x, "_keras_mask", None), v
-                        )
+                        mask = tree.map_structure(backend.get_keras_mask, v)
                         kwargs[expected_mask_arg_name] = mask
+
+        # We need to cache the `previous_mask` before `__call__` because the
+        # mask might be removed during the call, such as `MultiHeadAttention`.
+        if "mask" in kwargs and kwargs["mask"] is not None:
+            # Case 1: Mask was explicitly passed or auto-populated in step 6.
+            previous_mask = kwargs["mask"]
+        else:
+            # Case 2: Fallback to the mask attached to the first input tensor.
+            previous_mask = tree.map_structure(
+                backend.get_keras_mask, call_spec.first_arg
+            )
 
         ####################
         # 7. Call the layer.
@@ -840,7 +996,6 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 elif self.compute_dtype != self.variable_dtype:
                     # Enter a new scope if our dtypes are "mixed".
                     new_scope = backend.AutocastScope(self.compute_dtype)
-
                 if new_scope is not None:
                     with new_scope:
                         outputs = super().__call__(*args, **kwargs)
@@ -859,20 +1014,24 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                             outputs, layout
                         )
 
-                if not self.built:
-                    self.built = True
+                self.built = True
                 # Record activity regularizer loss.
                 if self.activity_regularizer is not None:
                     for output in tree.flatten(outputs):
                         if backend.is_tensor(output):
-                            self.add_loss(self.activity_regularizer(output))
+                            loss = self.activity_regularizer(output)
+                            if output.ndim > 0:
+                                # Normalize by batch size to ensure consistent
+                                # regularization strength across batch sizes
+                                batch_size = ops.cast(
+                                    ops.shape(output)[0], dtype=loss.dtype
+                                )
+                                loss = ops.divide_no_nan(loss, batch_size)
+                            self.add_loss(loss)
 
-            # Set masks on outputs,
-            # provided only the first positional input arg and its mask.
+            # Set `previous_mask` on outputs if available. It is provided only
+            # for the first positional input arg and its mask.
             # TODO: consider extending this to all args and kwargs.
-            previous_mask = tree.map_structure(
-                lambda x: getattr(x, "_keras_mask", None), call_spec.first_arg
-            )
             if self.supports_masking:
                 self._set_mask_metadata(
                     call_spec.first_arg, outputs, previous_mask
@@ -888,19 +1047,46 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         finally:
             # Destroy call context if we created it
             self._maybe_reset_call_context()
+
+        ################################################
+        # 8. Add a node in the graph for symbolic calls.
+        if any_symbolic_tensors(original_args, original_kwargs):
+            Node(
+                operation=self,
+                call_args=original_args,
+                call_kwargs=original_kwargs,
+                outputs=outputs,
+            )
+
         return outputs
 
     def call(self, *args, **kwargs):
-        raise NotImplementedError(
-            f"Layer {self.__class__.__name__} does not have a `call()` "
-            "method implemented."
-        )
+        raise self._not_implemented_error(self.call)
 
-    def quantized_call(self, *args, **kwargs):
-        raise NotImplementedError(
-            f"Layer {self.__class__.__name__} does not have a "
-            "`quantized_call()` method implemented."
-        )
+    def _resolve_and_populate_arg(
+        self, arg_name, call_spec, call_context, kwargs
+    ):
+        # 1) user explicitly passed it?
+        if arg_name in call_spec.user_arguments_dict:
+            value = call_spec.user_arguments_dict[arg_name]
+            call_context.set_value(arg_name, value)
+        # 2) else: inherited from outer layer call?
+        elif call_context.get_value(arg_name) is not None:
+            value = call_context.get_value(arg_name)
+        # 3) else: default from the call() signature. This stays local: the
+        # call context is shared across the whole call tree, so propagating
+        # it would let a non-None default (e.g. a preprocessing layer's
+        # `training=True`) leak to sibling and downstream layers. The bound
+        # `call()` still applies its own default, so there is nothing
+        # further to do here.
+        else:
+            return
+
+        if (
+            self._call_has_context_arg.get(arg_name, False)
+            and value is not None
+        ):
+            kwargs[arg_name] = value
 
     @traceback_utils.filter_traceback
     def stateless_call(
@@ -955,7 +1141,6 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         ```
         """
         self._check_super_called()
-
         if not self.built:
             raise ValueError(
                 f"To call stateless_call, {self.__class__.__name__} must be "
@@ -986,19 +1171,43 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         )
         mapping = list(trainable_mapping) + list(non_trainable_mapping)
 
-        # Call in stateless scope
-        losses = None
-        with backend.StatelessScope(
-            state_mapping=mapping, collect_losses=return_losses
-        ) as scope:
-            if isinstance(
-                self.dtype_policy, dtype_policies.QuantizedDTypePolicy
-            ):
-                outputs = self.quantized_call(*args, **kwargs)
-            else:
-                outputs = self.call(*args, **kwargs)
-            if return_losses:
-                losses = self.losses
+        # Caches info about `call()` signature, args, kwargs.
+        call_spec = CallSpec(
+            self._call_signature, self._call_context_args, args, kwargs
+        )
+
+        # Maintains info about the `Layer.call` stack across nested calls.
+        call_context = self._get_call_context()
+
+        for context_arg in self._call_context_args:
+            self._resolve_and_populate_arg(
+                context_arg, call_spec, call_context, kwargs
+            )
+
+        try:
+            # Call in stateless scope
+            losses = None
+            with backend.StatelessScope(
+                state_mapping=mapping, collect_losses=return_losses
+            ) as scope:
+                if self.dtype_policy.quantization_mode is not None:
+                    if self._remat_mode is not None:
+                        outputs = self.rematerialized_call(
+                            self.quantized_call, *args, **kwargs
+                        )(*args, **kwargs)
+                    else:
+                        outputs = self.quantized_call(*args, **kwargs)
+                elif self._remat_mode is not None:
+                    outputs = self.rematerialized_call(
+                        self.call, *args, **kwargs
+                    )(*args, **kwargs)
+                else:
+                    outputs = self.call(*args, **kwargs)
+                if return_losses:
+                    losses = self.losses
+        finally:
+            # Destroy call context if we created it
+            self._maybe_reset_call_context()
 
         # Gather updated non-trainable variables
         non_trainable_variables = []
@@ -1015,7 +1224,9 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             return super().compute_output_spec(*args, **kwargs)
         else:
             # Use compute_output_shape() to return the right output spec
-            call_spec = CallSpec(self._call_signature, args, kwargs)
+            call_spec = CallSpec(
+                self._call_signature, self._call_context_args, args, kwargs
+            )
             shapes_dict = get_shapes_dict(call_spec)
             shapes_dict = update_shapes_dict_for_target_fn(
                 self.compute_output_shape,
@@ -1056,9 +1267,9 @@ class Layer(BackendLayer, Operation, KerasSaveable):
 
     @utils.default
     def compute_output_shape(self, *args, **kwargs):
-        raise NotImplementedError(
-            f"Layer {self.__class__.__name__} should implement "
-            "`def compute_output_shape(self, input_shape)`."
+        raise self._not_implemented_error(
+            self.compute_output_shape,
+            "Should implement `def compute_output_shape(self, input_shape)`.",
         )
 
     def add_loss(self, loss):
@@ -1086,8 +1297,8 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             scope = backend.get_stateless_scope()
             if scope.collect_losses:
                 for x in losses:
-                    scope.add_loss(loss)
-                    self._loss_ids.add(id(loss))
+                    scope.add_loss(x)
+                    self._loss_ids.add(id(x))
         else:
             self._losses.extend(losses)
 
@@ -1107,7 +1318,10 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         for variable in self.trainable_weights:
             if variable.regularizer is None:
                 continue
-            if backend.in_stateless_scope():
+            if backend.in_stateless_scope() and not in_symbolic_scope():
+                # If in symbolic scope, we might get `None` from
+                # `get_current_value` in `backend.compute_output_spec`. So we
+                # assign `variable` instead.
                 v = backend.get_stateless_scope().get_current_value(variable)
             else:
                 v = variable
@@ -1130,19 +1344,24 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         if backend.in_stateless_scope():
             scope = backend.get_stateless_scope()
             if scope.collect_losses:
-                for x in scope.losses:
-                    if id(x) in self._loss_ids:
-                        scope.losses.remove(x)
+                # Filter by identity (id) rather than using list.remove(),
+                # which compares by value. Value comparison on JAX tracers
+                # during JIT causes TracerBoolConversionError.
+                scope.losses[:] = [
+                    x for x in scope.losses if id(x) not in self._loss_ids
+                ]
         self._losses.clear()
         self._loss_ids.clear()
         for layer in self._layers:
             layer._clear_losses()
 
-    def quantize(self, mode):
-        raise NotImplementedError(
-            f"Layer {self.__class__.__name__} does not have a `quantize()` "
-            "method implemented."
-        )
+    # Quantization-related (int8 and float8) methods
+
+    def quantized_build(self, input_shape, mode):
+        raise self._not_implemented_error(self.quantized_build)
+
+    def quantize(self, mode=None, type_check=True, config=None):
+        raise self._not_implemented_error(self.quantize)
 
     def _check_quantize_args(self, mode, compute_dtype):
         if not self.built:
@@ -1171,6 +1390,73 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 "'mixed_float16' before calling `quantize()`."
             )
 
+    def quantized_call(self, *args, **kwargs):
+        current_remat_mode = get_current_remat_mode()
+
+        if (
+            current_remat_mode != self._remat_mode
+            and current_remat_mode is not None
+        ):
+            warnings.warn(
+                f"The RematScope at call time ({current_remat_mode}) differs "
+                f"the one set during layer initialization "
+                f"({self._remat_mode}). "
+                f"Restoring the correct rematerialization mode "
+                f"{self._remat_mode} for this layer."
+            )
+        if self.quantization_mode == "int8":
+            return self._int8_call(*args, **kwargs)
+        elif self.quantization_mode == "float8":
+            return self._float8_call(*args, **kwargs)
+        elif self.quantization_mode == "int4":
+            return self._int4_call(*args, **kwargs)
+        elif self.quantization_mode == "ternary":
+            return self._ternary_call(*args, **kwargs)
+        elif self.quantization_mode == "gptq":
+            return self._gptq_call(*args, **kwargs)
+        elif self.quantization_mode == "awq":
+            return self._awq_call(*args, **kwargs)
+        else:
+            raise self._quantization_mode_error(self.quantization_mode)
+
+    def _int4_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._int4_call)
+
+    def _ternary_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._ternary_call)
+
+    def _int8_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._int8_call)
+
+    def _float8_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._float8_call)
+
+    def _gptq_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._gptq_call)
+
+    def _awq_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._awq_call)
+
+    def _not_implemented_error(self, attr, msg=None):
+        if callable(attr):
+            attr_name = attr.__name__
+            attr_type = "method"
+        else:
+            attr_name = str(attr)
+            attr_type = "attribute"
+        msg = f" {msg}" if msg is not None else ""
+        return NotImplementedError(
+            f"Layer {self.__class__.__name__} does not have a `{attr_name}` "
+            f"{attr_type} implemented.{msg}"
+        )
+
+    def _quantization_mode_error(self, mode):
+        return NotImplementedError(
+            "Invalid quantization mode. Expected one of "
+            f"{dtype_policies.QUANTIZATION_MODES}. "
+            f"Received: quantization_mode={mode}"
+        )
+
     def save_own_variables(self, store):
         """Saves the state of the layer.
 
@@ -1184,15 +1470,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         for i, v in enumerate(all_vars):
             store[f"{i}"] = v
 
-    def load_own_variables(self, store):
-        """Loads the state of the layer.
-
-        You can override this method to take full control of how the state of
-        the layer is loaded upon calling `keras.models.load_model()`.
-
-        Args:
-            store: Dict from which the state of the model will be loaded.
-        """
+    def _check_load_own_variables(self, store):
         all_vars = self._trainable_variables + self._non_trainable_variables
         if len(store.keys()) != len(all_vars):
             if len(all_vars) == 0 and not self.built:
@@ -1225,6 +1503,18 @@ class Layer(BackendLayer, Operation, KerasSaveable):
                 f"{len(store.keys())} variables during loading. "
                 f"Expected: {[v.name for v in all_vars]}"
             )
+
+    def load_own_variables(self, store):
+        """Loads the state of the layer.
+
+        You can override this method to take full control of how the state of
+        the layer is loaded upon calling `keras.models.load_model()`.
+
+        Args:
+            store: Dict from which the state of the model will be loaded.
+        """
+        self._check_load_own_variables(store)
+        all_vars = self._trainable_variables + self._non_trainable_variables
         for i, v in enumerate(all_vars):
             v.assign(store[f"{i}"])
 
@@ -1245,9 +1535,15 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             self._tracker.lock()
         self._post_untrack_variable(variable)
 
-    def add_metric(self):
+    def add_metric(self, *args, **kwargs):
         # Permanently disabled
-        raise NotImplementedError
+        raise NotImplementedError(
+            "Layer `add_metric()` method is deprecated. "
+            "Add your metric in `Model.compile(metrics=[...])`, "
+            "or create metric trackers in init() or build() "
+            "when subclassing the layer or model, then call "
+            "`metric.update_state()` whenever necessary."
+        )
 
     def count_params(self):
         """Count the total number of scalars composing the weights.
@@ -1344,8 +1640,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
 
     def __repr__(self):
         return (
-            f"<{self.__class__.__name__} "
-            f"name={self.name}, built={self.built}>"
+            f"<{self.__class__.__name__} name={self.name}, built={self.built}>"
         )
 
     def __str__(self):
@@ -1358,7 +1653,41 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             if not hasattr(self, "_tracker"):
                 self._initialize_tracker()
             value = self._tracker.track(value)
-        return super().__setattr__(name, value)
+
+        # NNX-specific bypass for Keras-internal bookkeeping attributes:
+        # some are set during a traced call (e.g. inside the jitted train
+        # step), which nnx.Module.__setattr__ forbids, and
+        # `_compiled_trainable_state` is a dict keyed by layer objects,
+        # which flax's attribute scanning cannot process.
+        if (
+            backend.backend() == "jax"
+            and is_nnx_enabled()
+            and name
+            in (
+                "_called",
+                "built",
+                "_losses_override",
+                "_compiled_trainable_state",
+            )
+        ):
+            object.__setattr__(self, name, value)
+            return
+
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        obj = getattr(self, name)
+        if isinstance(obj, backend.Variable):
+            import gc
+
+            # It will take a short amount of time for the corresponding buffer
+            # to be actually removed from the device.
+            # https://stackoverflow.com/a/74631949
+            self._untrack_variable(obj)
+            super().__delattr__(name)
+            gc.collect()
+        else:
+            super().__delattr__(name)
 
     def _check_super_called(self):
         if getattr(self, "_lock", True):
@@ -1370,9 +1699,19 @@ class Layer(BackendLayer, Operation, KerasSaveable):
 
     def _assert_input_compatibility(self, arg_0):
         if self.input_spec:
-            input_spec.assert_input_compatibility(
-                self.input_spec, arg_0, layer_name=self.name
-            )
+            try:
+                input_spec.assert_input_compatibility(
+                    self.input_spec, arg_0, layer_name=self.name
+                )
+            except SystemError:
+                if backend.backend() == "torch":
+                    # TODO: The torch backend failed the ONNX CI with the error:
+                    # SystemError: <method '__int__' of 'torch._C.TensorBase'
+                    # objects> returned a result with an exception set
+                    # As a workaround, we are skipping this for now.
+                    pass
+                else:
+                    raise
 
     def _get_call_context(self):
         """Returns currently active `CallContext`."""
@@ -1412,7 +1751,7 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         flat_outputs = tree.flatten(outputs)
 
         mask_already_computed = all(
-            getattr(x, "_keras_mask", None) is not None for x in flat_outputs
+            backend.get_keras_mask(x) is not None for x in flat_outputs
         )
         if mask_already_computed:
             return
@@ -1423,18 +1762,8 @@ class Layer(BackendLayer, Operation, KerasSaveable):
 
         flat_masks = tree.flatten(output_masks)
         for tensor, mask in zip(flat_outputs, flat_masks):
-            if getattr(tensor, "_keras_mask", None) is None:
-                try:
-                    # Numpy backend does not support masking.
-                    if backend.backend() == "numpy":
-                        warnings.warn(
-                            "The NumPy backend does not support masking at this"
-                            "time. Masks will be ignored."
-                        )
-                    tensor._keras_mask = mask
-                except AttributeError:
-                    # It's a C type.
-                    pass
+            if backend.get_keras_mask(tensor) is None and mask is not None:
+                backend.set_keras_mask(tensor, mask)
 
     @python_utils.default
     def get_config(self):
@@ -1444,12 +1773,119 @@ class Layer(BackendLayer, Operation, KerasSaveable):
             "trainable": self.trainable,
             "dtype": dtype_policies.serialize(self.dtype_policy),
         }
+        if self.activity_regularizer is not None:
+            config["activity_regularizer"] = regularizers.serialize(
+                self.activity_regularizer
+            )
         return {**base_config, **config}
 
     def _open_name_scope(self):
+        from keras.src.utils import jax_utils  # avoid circular imports
+
         if self._parent_path is None:
-            self._parent_path = current_path()
+            # Avoid mutating _parent_path during a JAX trace if it's part of
+            # nnx.Object state and the object was created at a different trace
+            # level. We check if we are in NNX mode and if we are in a JAX
+            # trace.
+            if not (is_nnx_enabled() and jax_utils.is_in_jax_tracing_scope()):
+                self._parent_path = current_path()
+
         return backend.name_scope(self.name, caller=self)
+
+    def rematerialized_call(self, layer_call, *args, **kwargs):
+        """Enable rematerialization dynamically for layer's call method.
+
+        Args:
+            layer_call: The original `call` method of a layer.
+
+        Returns:
+            Rematerialized layer's `call` method.
+        """
+        if not self._remat_mode:
+            return layer_call
+        if self._remat_mode.mode == "activations":
+            has_activation = (
+                hasattr(self, "activation") and self.activation is not None
+            )
+            if has_activation:
+
+                @functools.wraps(layer_call)
+                def rematerialized_activation_call_wrapper(*args, **kwargs):
+                    original_activation = self.activation
+                    self.activation = remat.remat(original_activation)
+                    try:
+                        return layer_call(*args, **kwargs)
+                    finally:
+                        self.activation = original_activation
+
+                return rematerialized_activation_call_wrapper
+        elif self._remat_mode.mode == "list_of_layers" and (
+            self.name in self._remat_mode.layer_names
+        ):
+            return remat.remat(layer_call)
+        return super().rematerialized_call(layer_call, *args, **kwargs)
+
+    def _register_call_context_args(self, *names):
+        """Registers call-context args for this layer.
+
+        If this layer declares a `call()` method that accepts
+        one or more of the given args, those args will be
+        automatically injected into the call signature of this
+        layer. This layer will also propagate the args to any
+        nested sublayers that are called from within this layer.
+
+        If this layer doesn't declare a `call()` method that
+        accepts one or more of the given args, these args will
+        simply be propagated to any nested sublayers without
+        being injected into the call signature of this layer.
+        This is useful for propagating custom arguments
+        from top-level layers/models to sublayers.
+
+        Example:
+        ```
+        class Inner(layers.Layer):
+
+            def __init__(self):
+                super().__init__()
+                # Register `foo_mode` as a call-context arg
+                self._register_call_context_args("foo_mode")
+
+            def call(self, x, foo_mode=False):
+                # If foo_mode=True add 1, otherwise add 0
+                add_val = ops.where(foo_mode, 1.0, 0.0)
+                return x + add_val
+
+        class Outer(layers.Layer):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+
+            def call(self, x):
+                # We don't explicitly pass foo_mode here—Base Layer.__call__
+                # should inject it into `self.inner`
+                return self.inner(x)
+
+        sample_input = np.array([[1.0], [2.0]])
+
+        # Sequential model
+        seq = models.Sequential([Outer()])
+
+        # Tell the Sequential model to propagate foo_mode down
+        # the call-stack
+        seq._register_call_context_args("foo_mode")
+
+        # foo_mode=True -> input + 1
+        out_true = seq(sample_input, foo_mode=True)
+        """
+        if self._called:
+            raise RuntimeError(
+                "Cannot add call-context args after the layer has been called."
+            )
+        self._call_context_args = self._call_context_args | set(names)
+
+        self._call_has_context_arg.update(
+            {arg: (arg in self.call_signature_parameters) for arg in names}
+        )
 
 
 def is_backend_tensor_or_symbolic(x, allow_none=False):
@@ -1459,20 +1895,21 @@ def is_backend_tensor_or_symbolic(x, allow_none=False):
 
 
 class CallSpec:
-    def __init__(self, signature, args, kwargs):
-        # `training` and `mask` are special kwargs that are always available in
-        # a layer, if user specifies them in their call without adding to spec,
-        # we remove them to be able to bind variables. User is not using
-        # `training` anyway so we can ignore.
-        # TODO: If necessary use workaround for `mask`
-        if "training" in kwargs and "training" not in signature.parameters:
-            kwargs.pop("training")
-            bound_args = signature.bind(*args, **kwargs)
-        else:
-            bound_args = signature.bind(*args, **kwargs)
-        self.user_arguments_dict = {
-            k: v for k, v in bound_args.arguments.items()
+    def __init__(self, signature, call_context_args, args, kwargs):
+        # Strip out user-supplied call-context args that this layer’s `call()`
+        # does not accept (otherwise `signature.bind` would raise).
+        # This includes built-in args like `training`, and user-defined args.
+        call_args = {
+            context_arg: kwargs.pop(context_arg)
+            for context_arg in call_context_args
+            if context_arg in kwargs and context_arg not in signature.parameters
         }
+
+        bound_args = signature.bind(*args, **kwargs)
+
+        # Combine the two dicts.
+        self.user_arguments_dict = {**call_args, **bound_args.arguments}
+
         bound_args.apply_defaults()
         arg_dict = {}
         arg_names = []
@@ -1538,9 +1975,13 @@ def get_shapes_dict(call_spec):
     {"input_a_shape": (2, 3)}
     ```
     """
+
+    def standardize_shape_or_none(x):
+        return None if x is None else backend.standardize_shape(x.shape)
+
     shapes_dict = {}
     for k, v in call_spec.tensor_arguments_dict.items():
-        if k == "mask" or k.endswith("_mask"):
+        if k == "mask":
             # Do not include mask tensors in shapes dict
             continue
         if k == "kwargs" or k == "args":
@@ -1548,10 +1989,10 @@ def get_shapes_dict(call_spec):
             continue
         if k in call_spec.nested_tensor_argument_names:
             shapes_dict[f"{k}_shape"] = tree.map_structure(
-                lambda x: backend.standardize_shape(x.shape), v
+                standardize_shape_or_none, v
             )
         else:
-            shapes_dict[f"{k}_shape"] = backend.standardize_shape(v.shape)
+            shapes_dict[f"{k}_shape"] = standardize_shape_or_none(v)
     return shapes_dict
 
 
@@ -1634,7 +2075,14 @@ def update_shapes_dict_for_target_fn(
 class CallContext:
     def __init__(self, entry_layer):
         self.entry_layer = entry_layer
-        self.training = None
+
+    def get_value(self, arg_name, default=None):
+        """Get the context value for `arg_name`, or `default` if unset."""
+        return getattr(self, arg_name, default)
+
+    def set_value(self, arg_name, value):
+        """Set `arg_name` = `value` on this context object."""
+        setattr(self, arg_name, value)
 
 
 def is_shape_tuple(s):

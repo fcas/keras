@@ -1,6 +1,5 @@
 import tensorflow as tf
 
-from keras.src.backend import config
 from keras.src.backend import standardize_dtype
 from keras.src.backend.common import dtypes
 from keras.src.backend.tensorflow.core import cast
@@ -9,6 +8,12 @@ from keras.src.backend.tensorflow.core import convert_to_tensor
 
 def segment_sum(data, segment_ids, num_segments=None, sorted=False):
     if sorted:
+        if num_segments is not None:
+            raise ValueError(
+                "Argument `num_segments` cannot be set when sorted is True "
+                "when using the tensorflow backend."
+                f"Received: num_segments={num_segments}, sorted={sorted}."
+            )
         return tf.math.segment_sum(data, segment_ids)
     else:
         if num_segments is None:
@@ -19,19 +24,62 @@ def segment_sum(data, segment_ids, num_segments=None, sorted=False):
 
 def segment_max(data, segment_ids, num_segments=None, sorted=False):
     if sorted:
+        if num_segments is not None:
+            raise ValueError(
+                "Argument `num_segments` cannot be set when sorted is True "
+                "when using the tensorflow backend."
+                f"Received: num_segments={num_segments}, sorted={sorted}."
+            )
         return tf.math.segment_max(data, segment_ids)
     else:
         if num_segments is None:
-            unique_segment_ids, _ = tf.unique(segment_ids)
-            num_segments = tf.shape(unique_segment_ids)[0]
+            num_segments = tf.cast(tf.reduce_max(segment_ids) + 1, tf.int32)
         return tf.math.unsorted_segment_max(data, segment_ids, num_segments)
 
 
-def top_k(x, k, sorted=True):
+def segment_min(data, segment_ids, num_segments=None, sorted=False):
+    if sorted:
+        if num_segments is not None:
+            raise ValueError(
+                "Argument `num_segments` cannot be set when sorted is True "
+                "when using the tensorflow backend."
+                f"Received: num_segments={num_segments}, sorted={sorted}."
+            )
+        return tf.math.segment_min(data, segment_ids)
+    else:
+        if num_segments is None:
+            num_segments = tf.cast(tf.reduce_max(segment_ids) + 1, tf.int32)
+        return tf.math.unsorted_segment_min(data, segment_ids, num_segments)
+
+
+def segment_prod(data, segment_ids, num_segments=None, sorted=False):
+    if sorted:
+        if num_segments is not None:
+            raise ValueError(
+                "Argument `num_segments` cannot be set when sorted is True "
+                "when using the tensorflow backend."
+                f"Received: num_segments={num_segments}, sorted={sorted}."
+            )
+        return tf.math.segment_prod(data, segment_ids)
+    else:
+        if num_segments is None:
+            num_segments = tf.cast(tf.reduce_max(segment_ids) + 1, tf.int32)
+        return tf.math.unsorted_segment_prod(data, segment_ids, num_segments)
+
+
+def top_k(x, k, sorted=True, is_stable=True):
     return tf.math.top_k(x, k, sorted=sorted)
 
 
 def in_top_k(targets, predictions, k):
+    if len(predictions.shape) > 2:
+        targets = convert_to_tensor(targets)
+        predictions = convert_to_tensor(predictions)
+        original_shape = tf.shape(targets)
+        predictions = tf.reshape(predictions, [-1, tf.shape(predictions)[-1]])
+        targets = tf.reshape(targets, [-1])
+        result = tf.math.in_top_k(targets, predictions, k)
+        return tf.reshape(result, original_shape)
     return tf.math.in_top_k(targets, predictions, k)
 
 
@@ -39,16 +87,18 @@ def logsumexp(x, axis=None, keepdims=False):
     return tf.math.reduce_logsumexp(x, axis=axis, keepdims=keepdims)
 
 
-def qr(x, mode="reduced"):
-    if mode not in {"reduced", "complete"}:
-        raise ValueError(
-            "`mode` argument value not supported. "
-            "Expected one of {'reduced', 'complete'}. "
-            f"Received: mode={mode}"
-        )
-    if mode == "reduced":
-        return tf.linalg.qr(x)
-    return tf.linalg.qr(x, full_matrices=True)
+def cdist(x, y):
+    x = convert_to_tensor(x)
+    y = convert_to_tensor(y)
+    dtype = dtypes.result_type(x.dtype, y.dtype, float)
+    x = cast(x, dtype)
+    y = cast(y, dtype)
+    if x.shape.rank < 2 or y.shape.rank < 2:
+        raise ValueError("`cdist` inputs must have rank >= 2")
+    if x.shape[-1] != y.shape[-1]:
+        raise ValueError("Last dimension of inputs to `cdist` must match")
+    diff = tf.expand_dims(x, -2) - tf.expand_dims(y, -3)
+    return tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1))
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -99,6 +149,15 @@ def fft2(x):
     complex_input = _get_complex_tensor_from_tuple(x)
     complex_output = tf.signal.fft2d(complex_input)
     return tf.math.real(complex_output), tf.math.imag(complex_output)
+
+
+def ifft2(x):
+    real, imag = x
+    h = cast(tf.shape(real)[-2], real.dtype)
+    w = cast(tf.shape(real)[-1], real.dtype)
+    real_conj, imag_conj = real, -imag
+    fft_real, fft_imag = fft2((real_conj, imag_conj))
+    return fft_real / (h * w), -fft_imag / (h * w)
 
 
 def rfft(x, fft_length=None):
@@ -234,13 +293,14 @@ def istft(
     if length is not None:
         end = start + length
     elif center is True:
-        end = -(fft_length // 2)
+        end = expected_output_len - (fft_length // 2)
     else:
         end = expected_output_len
     return x[..., start:end]
 
 
 def rsqrt(x):
+    x = convert_to_tensor(x)
     return tf.math.rsqrt(x)
 
 
@@ -248,108 +308,38 @@ def erf(x):
     return tf.math.erf(x)
 
 
+def erfc(x):
+    x = convert_to_tensor(x)
+    return tf.math.erfc(x)
+
+
 def erfinv(x):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+
+    if dtype in ["bfloat16", "float16"]:
+        return tf.cast(
+            tf.math.erfinv(tf.cast(x, tf.float32)),
+            dtype,
+        )
+
     return tf.math.erfinv(x)
 
 
-def solve(a, b):
-    a = convert_to_tensor(a)
-    b = convert_to_tensor(b)
-    return tf.linalg.solve(a, b)
-
-
-def norm(x, ord=None, axis=None, keepdims=False):
-    from keras.src.backend.tensorflow.numpy import moveaxis
-
+def logdet(x):
     x = convert_to_tensor(x)
-    x_shape = x.shape
-    ndim = x_shape.rank
+    return tf.linalg.logdet(x)
 
-    if axis is None:
-        axis = tuple(range(ndim))
-    elif isinstance(axis, int):
-        axis = (axis,)
 
-    axis = axis[0] if len(axis) == 1 else axis
-    num_axes = 1 if isinstance(axis, int) else len(axis)
+def gammainc(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
 
-    if num_axes == 1 and ord is None:
-        ord = "euclidean"
-    elif num_axes == 2 and ord is None:
-        ord = "fro"
+    compute_dtype = dtype
+    if standardize_dtype(dtype) in ("float16", "bfloat16"):
+        compute_dtype = "float32"
+    x1 = cast(x1, compute_dtype)
+    x2 = cast(x2, compute_dtype)
 
-    if standardize_dtype(x.dtype) == "int64":
-        dtype = config.floatx()
-    else:
-        dtype = dtypes.result_type(x.dtype, float)
-    x = cast(x, dtype)
-
-    # Fast path to utilze `tf.linalg.norm`
-    if (num_axes == 1 and ord in ("euclidean", 1, 2, float("inf"))) or (
-        num_axes == 2 and ord in ("euclidean", "fro", 1, 2, float("inf"))
-    ):
-        return tf.linalg.norm(x, ord=ord, axis=axis, keepdims=keepdims)
-
-    # Ref: jax.numpy.linalg.norm
-    if num_axes == 1 and ord not in ("fro", "nuc"):
-        if ord == float("-inf"):
-            return tf.math.reduce_min(
-                tf.math.abs(x), axis=axis, keepdims=keepdims
-            )
-        elif ord == 0:
-            return tf.math.reduce_sum(
-                tf.cast(tf.not_equal(x, 0), dtype=x.dtype),
-                axis=axis,
-                keepdims=keepdims,
-            )
-        else:
-            ord = convert_to_tensor(ord, dtype=x.dtype)
-            out = tf.math.reduce_sum(
-                tf.pow(tf.math.abs(x), ord), axis=axis, keepdims=keepdims
-            )
-            return tf.pow(out, 1.0 / ord)
-    elif num_axes == 2 and ord in ("nuc", float("-inf"), -2, -1):
-        row_axis, col_axis = axis[0], axis[1]
-        row_axis = row_axis + ndim if row_axis < 0 else row_axis
-        col_axis = col_axis + ndim if col_axis < 0 else col_axis
-        if ord == float("-inf"):
-            if not keepdims and row_axis > col_axis:
-                row_axis -= 1
-            x = tf.math.reduce_min(
-                tf.reduce_sum(tf.math.abs(x), axis=col_axis, keepdims=keepdims),
-                axis=row_axis,
-                keepdims=keepdims,
-            )
-        elif ord == -1:
-            if not keepdims and col_axis > row_axis:
-                col_axis -= 1
-            x = tf.math.reduce_min(
-                tf.reduce_sum(tf.math.abs(x), axis=row_axis, keepdims=keepdims),
-                axis=col_axis,
-                keepdims=keepdims,
-            )
-        else:
-            x = moveaxis(x, axis, (-2, -1))
-            if ord == -2:
-                x = tf.math.reduce_min(
-                    tf.linalg.svd(x, compute_uv=False), axis=-1
-                )
-            else:
-                x = tf.math.reduce_sum(
-                    tf.linalg.svd(x, compute_uv=False), axis=-1
-                )
-            if keepdims:
-                x = tf.expand_dims(x, axis[0])
-                x = tf.expand_dims(x, axis[1])
-        return x
-
-    if num_axes == 1:
-        raise ValueError(
-            f"Invalid `ord` argument for vector norm. Received: ord={ord}"
-        )
-    elif num_axes == 2:
-        raise ValueError(
-            f"Invalid `ord` argument for matrix norm. Received: ord={ord}"
-        )
-    else:
-        raise ValueError(f"Invalid axis values. Received: axis={axis}")
+    return cast(tf.math.igamma(x1, x2), dtype)

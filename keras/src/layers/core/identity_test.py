@@ -6,14 +6,13 @@ from keras.src import layers
 from keras.src import testing
 
 
-class IdentityTest(testing.TestCase, parameterized.TestCase):
+class IdentityTest(testing.TestCase):
     @parameterized.named_parameters(
         [
             {"testcase_name": "dense", "sparse": False},
             {"testcase_name": "sparse", "sparse": True},
         ]
     )
-    @pytest.mark.requires_trainable_backend
     def test_identity_basics(self, sparse):
         if sparse and not backend.SUPPORTS_SPARSE_TENSORS:
             pytest.skip("Backend does not support sparse tensors.")
@@ -30,4 +29,5 @@ class IdentityTest(testing.TestCase, parameterized.TestCase):
             expected_num_losses=0,
             run_training_check=not sparse,
             supports_masking=True,
+            assert_built_after_instantiation=True,
         )

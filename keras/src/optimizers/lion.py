@@ -9,13 +9,13 @@ class Lion(optimizer.Optimizer):
 
     The Lion optimizer is a stochastic-gradient-descent method that uses the
     sign operator to control the magnitude of the update, unlike other adaptive
-    optimizers such as Adam that rely on second-order moments. This make
+    optimizers such as Adam that rely on second-order moments. This makes
     Lion more memory-efficient as it only keeps track of the momentum. According
     to the authors (see reference), its performance gain over Adam grows with
     the batch size. Because the update of Lion is produced through the sign
     operation, resulting in a larger norm, a suitable learning rate for Lion is
     typically 3-10x smaller than that for AdamW. The weight decay for Lion
-    should be in turn 3-10x larger than that for AdamW to maintain a
+    should in turn be 3-10x larger than that for AdamW to maintain a
     similar strength (lr * wd).
 
     Args:
@@ -55,7 +55,7 @@ class Lion(optimizer.Optimizer):
         ema_overwrite_frequency=None,
         loss_scale_factor=None,
         gradient_accumulation_steps=None,
-        name="lion",
+        name=None,
         **kwargs,
     ):
         super().__init__(
@@ -91,13 +91,7 @@ class Lion(optimizer.Optimizer):
         if self.built:
             return
         super().build(var_list)
-        self._momentums = []
-        for var in var_list:
-            self._momentums.append(
-                self.add_variable_from_reference(
-                    reference_variable=var, name="momentum"
-                )
-            )
+        self._momentums = self.add_optimizer_variables(var_list, "momentum")
 
     def update_step(self, gradient, variable, learning_rate):
         """Update step given gradient and the associated model variable."""
@@ -137,6 +131,7 @@ class Lion(optimizer.Optimizer):
         return config
 
 
-Lion.__doc__ = Lion.__doc__.replace(
-    "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
-)
+if Lion.__doc__ is not None:
+    Lion.__doc__ = Lion.__doc__.replace(
+        "{{base_optimizer_keyword_args}}", optimizer.base_optimizer_keyword_args
+    )

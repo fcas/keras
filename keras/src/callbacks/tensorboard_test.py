@@ -1,6 +1,7 @@
 import collections
 import os
 import random
+import sys
 
 import numpy as np
 import pytest
@@ -125,7 +126,7 @@ def list_summaries(logdir):
 class TestTensorBoardV2(testing.TestCase):
     def _get_log_dirs(self):
         logdir = os.path.join(
-            self.get_temp_dir(), str(random.randint(1, 1e7)), "tb"
+            self.get_temp_dir(), str(random.randint(1, int(1e7))), "tb"
         )
         train_dir = os.path.join(logdir, "train")
         validation_dir = os.path.join(logdir, "validation")
@@ -401,11 +402,10 @@ class TestTensorBoardV2(testing.TestCase):
             },
         )
         expected_image_summaries = {
-            _ObservedSummary(logdir=train_dir, tag="bias/image"),
-            _ObservedSummary(logdir=train_dir, tag="kernel/image"),
+            _ObservedSummary(logdir=train_dir, tag="image"),
         }
         self.assertEqual(
-            self._strip_variable_names(summary_file.images),
+            self._strip_layer_names(summary_file.images, model_type),
             expected_image_summaries,
         )
 
@@ -578,8 +578,7 @@ class TestTensorBoardV2(testing.TestCase):
         for s in summaries:
             if "/" not in s.tag:
                 raise ValueError(f"tag has no layer name: {s.tag!r}")
-            start_from = 2 if "subclass" in model_type else 1
-            new_tag = "/".join(s.tag.split("/")[start_from:])
+            new_tag = s.tag.split("/")[-1]
             result.add(s._replace(tag=new_tag))
         return result
 
@@ -736,14 +735,10 @@ class TestTensorBoardV2(testing.TestCase):
         pass
 
     @pytest.mark.skipif(
-        backend.backend() != "tensorflow",
-        reason="The profiling test can only run with TF backend.",
+        backend.backend() not in ("jax", "tensorflow"),
+        reason="The profiling test can only run with TF and JAX backends.",
     )
     def test_TensorBoard_auto_trace(self):
-        # TODO: Waiting for implementation for torch/jax for profiling ops
-        # if backend.backend() == "jax":
-        #       return
-        # TODO: Debug profiling for JAX
         logdir, train_dir, validation_dir = self._get_log_dirs()
         model = models.Sequential(
             [
@@ -753,6 +748,16 @@ class TestTensorBoardV2(testing.TestCase):
             ]
         )
         x, y = np.ones((10, 10, 10, 1)), np.ones((10, 1))
+        if backend.backend() == "jax" and sys.version_info[1] < 12:
+            with pytest.warns(match="backend requires python >= 3.12"):
+                callbacks.TensorBoard(
+                    logdir, histogram_freq=1, profile_batch=1, write_graph=False
+                )
+            self.skipTest(
+                "Profiling with JAX and python < 3.12 "
+                "raises segmentation fault."
+            )
+
         tb_cbk = callbacks.TensorBoard(
             logdir, histogram_freq=1, profile_batch=1, write_graph=False
         )
@@ -773,5 +778,5 @@ class TestTensorBoardV2(testing.TestCase):
                 _ObservedSummary(logdir=train_dir, tag="batch_1"),
             },
         )
-        self.assertEqual(1, self._count_xplane_file(logdir=logdir))
+        self.assertEqual(1, self._count_xplane_file(logdir=train_dir))
         pass
